@@ -514,9 +514,11 @@ fn every_element_the_shell_renders_is_written_by_the_app() {
 fn the_page_and_the_rules_agree_on_the_piles() {
     // A place is a `Place`, and the board spells it while the game numbers it.
     // The two are tied together in exactly one place: `Pile::place`.
-    let ui = read("src/ui.rs");
+    // The scene is built in `scene.rs`, which is compiled for the host too —
+    // so the arrangement of the board is something `cargo test` can check.
+    let page = read("src/ui.rs") + &read("src/scene.rs");
     assert!(
-        ui.contains("pile.place()") || ui.contains("Pile::place"),
+        page.contains("pile.place()") || page.contains("Pile::place"),
         "the page must ask the rules where a pile sits on the board"
     );
     let game = read("src/game.rs");
