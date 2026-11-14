@@ -6,12 +6,19 @@
 //! to be untestable, like "which pile is under this finger" and "does a drag
 //! count as a drag".
 //!
-//! **This file is carried, byte for byte, by both solitaire apps.** They are
-//! separate repositories, so nothing enforces that; the rule is that a change
-//! here belongs in both. Everything game-specific — the rules, the piles, the
-//! score, the words — stays in each app's `game.rs`, which is what makes this
-//! file possible: it is handed a description of the board and answers
-//! questions about it, and knows nothing about cards.
+//! **This file is carried, byte for byte, by both solitaires in this family** —
+//! Solitaire and Spider Solitaire. They are separate repositories, so nothing
+//! enforces that; the rule is that a change here belongs in both.
+//!
+//! Everything game-specific — the rules, the piles, the score, the words —
+//! stays in each app's `game.rs`, which is what makes this file possible: it is
+//! handed a description of the board and answers questions about it, and knows
+//! nothing about cards.
+//!
+//!
+//! **This file is carried, byte for byte, by both solitaires in this family** —
+//! Solitaire and Spider Solitaire. They are separate repositories, so nothing
+//! enforces that; the rule is that a change here belongs in both.
 //!
 //! Three decisions shape it:
 //!

@@ -583,6 +583,34 @@ fn the_shared_modules_name_neither_game() {
     }
 }
 
+/// The shared files carry their copy's rule, in the place a copier will look.
+///
+/// They are carried, byte for byte, by the other solitaire, and nothing on this
+/// host enforces that: they are separate repositories. So the *files* say so —
+/// a reader editing `board.rs` has to be told it is also Spider's board — and
+/// this test makes sure the note is not quietly deleted.
+#[test]
+fn the_shared_files_say_they_are_shared() {
+    for name in [
+        "src/board.rs",
+        "src/board_ui.rs",
+        "src/shell.rs",
+        "src/card.rs",
+    ] {
+        let text = read(name);
+        let header = &text[..text.len().min(2500)].to_lowercase();
+        assert!(
+            header.contains("both") && header.contains("solitaire"),
+            "{name} is carried by both apps; its header must say so, or the next \
+             reader edits one copy and leaves the other behind"
+        );
+        assert!(
+            header.contains("byte for byte"),
+            "{name} says how it is shared, not merely that it is"
+        );
+    }
+}
+
 /// The shared modules really are four files, not a copy in one app.
 ///
 /// Each app's own `ui.rs` must be small: it is a `Rules` implementation, not a

@@ -6,12 +6,14 @@
 //! wall time rather than counting timer callbacks, and a worker that never swaps
 //! itself in unasked. That is here, once.
 //!
+//! **This file is carried, byte for byte, by both solitaires in this family** —
+//! Solitaire and Spider Solitaire. They are separate repositories, so nothing
+//! enforces that; the rule is that a change here belongs in both.
+//!
 //! An app supplies its [`Rules`] — what the game is, what its choices mean, how
 //! a place is named — and keeps its own `game.rs`. The rules never cross this
 //! boundary: the shell asks the game what to do and shows what it says.
 //!
-//! **This file is carried, byte for byte, by both solitaire apps.**
-
 use std::cell::{Cell, RefCell};
 use std::rc::{Rc, Weak};
 

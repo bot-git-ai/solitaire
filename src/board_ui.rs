@@ -6,8 +6,10 @@
 //! [`Frame`], and answers the [`Intent`]s the board reports. It keeps its rules,
 //! its header, its menu and its words.
 //!
-//! **This file is carried, byte for byte, by both solitaire apps**, like
-//! [`crate::board`]. It knows about cards and piles and nothing about either
+//! **This file is carried, byte for byte, by both solitaires in this family** —
+//! Solitaire and Spider Solitaire. They are separate repositories, so nothing
+//! enforces that; the rule is that a change here belongs in both. Like
+//! [`crate::board`], it knows about cards and piles and nothing about either
 //! game.
 //!
 //! Five rules keep a gesture honest:
