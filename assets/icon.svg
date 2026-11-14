@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Solitaire">
+  <!-- The icon: a playing card with a spade on it.
+
+       The drawing sits inside the maskable safe zone. Android crops an
+       installed app's icon with whatever mask the launcher uses — a circle, a
+       squircle, a rounded square — and only the middle 80% of the image is
+       guaranteed to survive it, so anything drawn up to the edges loses its
+       edges. The card below is 256 x 320 of 512, centred, which leaves room for
+       the mask, for the launcher's own padding, and for the shape to read as a
+       card rather than as a clipped rectangle.
+
+       One colour, `#444444`, on a transparent ground — the whole family's icon
+       colour, which every app in the family shares and the template pins. A
+       static icon is drawn on surfaces it cannot know, so the bar is the 3:1
+       for a graphical object rather than the 4.5:1 for text: `#444444` reaches
+       8.28:1 on the light surface and 1.95:1 on the dark one — below it on
+       dark, a deliberate trade the family makes for one colour everywhere.
+       Every install icon is rasterized from this file at build time; this is the
+       source of truth, never a PNG. -->
+  <rect x="128" y="96" width="256" height="320" rx="26"
+        fill="none" stroke="#444444" stroke-width="20"/>
+  <!-- One filled shape: the spade's body and its stem. The stem starts inside
+       the body rather than below it, so no seam shows where the two meet. -->
+  <path fill="#444444" d="M256 156
+    C 294 198 326 231 326 263
+    C 326 294 301 312 278 301
+    C 266 295 259 283 256 270
+    C 253 283 246 295 234 301
+    C 211 312 186 294 186 263
+    C 186 231 218 198 256 156
+    Z
+    M256 282
+    L 274 334
+    Q 276 344 266 344
+    L 246 344
+    Q 236 344 238 334
+    Z"/>
+</svg>
