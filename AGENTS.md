@@ -11,9 +11,13 @@ applies here. What follows is what is specific to this game.
 - `src/game.rs` — Klondike: the deal, the move grammar, the score, the undo
   history, the hint heuristic, the save format, and **every word the page
   shows**. Also `web-sys`-free.
-- `src/ui.rs` — the browser layer, compiled for `wasm32` only: layout geometry,
-  the elements, pointer and keyboard handling, timers, storage and the service
-  worker. It decides nothing about the game.
+- `src/scene.rs` — the game as the board draws it: the piles, how each fans,
+  how many cells each occupies, where the keyboard starts. Compiled for the
+  host too, so `cargo test` checks the board's *arrangement* rather than only
+  its arithmetic.
+- `src/ui.rs` — the browser half: a `Rules` implementation and nothing else.
+  The board itself is [`src/board_ui.rs`], the page around it is
+  [`src/shell.rs`], and both are shared with the other solitaire.
 - `src/ui.html`, `src/style.css`, `src/service-worker.js`, `build.rs`,
   `assets/icon.svg` — the shell, the styles, the worker, the site writer and the
   icon, as the template describes them.
@@ -62,6 +66,15 @@ works. `left`/`top` animate on the main thread, so the card is in the right plac
 even at frame zero and the movement between frames is the decoration rather than
 the fact. The board also carries `.instant` for its first paint, so the deal
 arrives instantly instead of flying in from the corner.
+
+**A pile that fans sideways is given the cells it fans into.** A fan spreads by
+a fraction of the card's height, which is wider than a card's own cell, so an
+unbounded fan leaves its cell and the pile beside it paints over it — which is
+how three drawn cards came to hide under the first foundation. The waste
+occupies two cells and the board is laid out by accumulated spans rather than by
+pile index, so the top row still adds up to exactly the seven columns: one for
+the stock, two for the waste, four for the foundations. The fan is then clamped
+to its own cell, with a floor so three cards stay three cards at phone size.
 
 **The board is its own stacking context (`isolation: isolate`).** A card's
 `z-index` is what keeps a fanned column in order, and those numbers run into the

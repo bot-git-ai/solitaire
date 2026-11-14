@@ -11,12 +11,11 @@
 
 use wasm_bindgen::prelude::*;
 
-use crate::board::{Fan, Place, Scene, Slot};
+use crate::board::{Place, Scene};
 use crate::board_ui::Intent;
 use crate::card::deck;
 use crate::game::{
-    Difficulty, Game, Hint, Options, Pile, Report, Scoring, COLUMNS, FOUNDATIONS, OPTIONS_KEY,
-    STORAGE_KEY,
+    Difficulty, Game, Hint, Options, Pile, Report, Scoring, OPTIONS_KEY, STORAGE_KEY,
 };
 use crate::shell::{fresh_seed, Repeat, Rules};
 
@@ -128,80 +127,13 @@ impl Klondike {
     }
 }
 
-/// How a pile is drawn.
-fn fan_for(game: &Game, pile: Pile) -> Fan {
-    match pile {
-        Pile::Tableau(_) => Fan::COLUMN,
-        // The cards a draw-three turn exposed are fanned so the player can see
-        // and reach each; everything deeper is under them.
-        Pile::Waste => Fan::tail(game.difficulty().draw().clamp(1, 3)),
-        Pile::Stock | Pile::Foundation(_) => Fan::PACKET,
-    }
-}
-
-/// Where the keyboard should be: the stock while it has cards, else the first
-/// column with a card that can be picked up.
-fn default_focus(game: &Game) -> (Place, Option<usize>) {
-    if game.pile_len(Pile::Stock) > 0 {
-        return (Pile::Stock.place(), Some(game.pile_len(Pile::Stock) - 1));
-    }
-    for column in 0..COLUMNS {
-        let pile = Pile::Tableau(column);
-        let len = game.pile_len(pile);
-        if let Some(index) = (0..len)
-            .rev()
-            .find(|&index| !game.is_face_down(pile, index))
-        {
-            return (pile.place(), Some(index));
-        }
-    }
-    (Pile::Tableau(0).place(), None)
-}
-
 impl Rules for Klondike {
     fn deck(&self) -> Vec<crate::card::Card> {
         deck()
     }
 
     fn scene(&self) -> Scene {
-        let mut slots = Vec::with_capacity(Pile::ALL.len());
-        for pile in Pile::ALL {
-            let cards: Vec<(u16, bool)> = self
-                .game
-                .pile(pile)
-                .iter()
-                .enumerate()
-                .map(|(index, &id)| (id, self.game.is_face_down(pile, index)))
-                .collect();
-            let mut slot = Slot::new(
-                pile.place(),
-                fan_for(&self.game, pile),
-                self.game.pile_label(pile),
-            )
-            .with_mark(self.game.slot_mark(pile))
-            .with_cards(&cards);
-            if pile == Pile::Stock {
-                slot = slot.pressable();
-            }
-            slots.push(slot);
-        }
-        let mut scene = Scene::new(slots, 2 + FOUNDATIONS);
-        scene.held = self
-            .game
-            .selection()
-            .map(|held| (held.pile.place(), held.index));
-        scene.hint = self.hint.as_ref().and_then(|hint| match hint {
-            Hint::Move {
-                from, index, count, ..
-            } => Some((from.place(), *index, *count)),
-            Hint::Draw { .. } | Hint::Recycle { .. } => Some((
-                Pile::Stock.place(),
-                self.game.pile_len(Pile::Stock).saturating_sub(1),
-                1,
-            )),
-            Hint::None { .. } => None,
-        });
-        scene
+        crate::scene::scene(&self.game, self.hint.as_ref())
     }
 
     fn act(&mut self, intent: Intent) {
@@ -217,7 +149,7 @@ impl Rules for Klondike {
     }
 
     fn default_focus(&self) -> (Place, Option<usize>) {
-        default_focus(&self.game)
+        crate::scene::default_focus(&self.game)
     }
 
     fn hint(&mut self) -> Option<String> {
@@ -365,35 +297,5 @@ impl Klondike {
         if !report.words.is_empty() {
             self.words = Some(report.words);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn every_pile_has_a_place_and_every_place_has_a_pile() {
-        for pile in Pile::ALL {
-            assert_eq!(Klondike::pile(pile.place()), Some(pile));
-        }
-    }
-
-    #[test]
-    fn the_waste_fans_by_the_difficulty_and_a_packet_does_not() {
-        let easy = Game::new(Difficulty::Easy, Scoring::Standard, 1);
-        let hard = Game::new(Difficulty::Hard, Scoring::Standard, 1);
-        assert_eq!(fan_for(&easy, Pile::Waste).fan_tail, 1);
-        assert_eq!(fan_for(&hard, Pile::Waste).fan_tail, 3);
-        assert!(fan_for(&easy, Pile::Stock).stacked);
-        assert!(fan_for(&easy, Pile::Foundation(0)).stacked);
-        assert!(!fan_for(&easy, Pile::Tableau(0)).stacked);
-    }
-
-    #[test]
-    fn the_keyboard_starts_on_the_stock_while_there_is_one() {
-        let game = Game::new(Difficulty::Medium, Scoring::Standard, 3);
-        let focus = default_focus(&game);
-        assert_eq!(focus.0, Pile::Stock.place());
     }
 }
