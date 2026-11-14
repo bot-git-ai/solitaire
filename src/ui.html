@@ -50,7 +50,7 @@
 <div class="tools">
   <button id="undo" type="button">Undo</button>
   <button id="hint" type="button">Hint</button>
-  <button id="auto" type="button" disabled>Finish</button>
+  <button id="action" type="button" disabled>Finish</button>
   <input id="menu" type="checkbox" class="menu-toggle visually-hidden" aria-controls="menu-panel">
   <label for="menu" class="menu-button"><span>Menu</span></label>
 </div>
@@ -78,7 +78,7 @@
     <p id="game-summary" class="menu-summary"></p>
 
     <label for="difficulty">Difficulty</label>
-    <select id="difficulty">
+    <select id="difficulty" data-option>
       <option value="easy">Easy — one at a time</option>
       <option value="medium">Medium — three at a time</option>
       <option value="hard">Hard — three at a time, three passes</option>
@@ -86,7 +86,7 @@
     <p id="difficulty-note" class="menu-note"></p>
 
     <label for="scoring">Scoring</label>
-    <select id="scoring">
+    <select id="scoring" data-option>
       <option value="standard">Standard</option>
       <option value="vegas">Vegas</option>
       <option value="off">No score</option>

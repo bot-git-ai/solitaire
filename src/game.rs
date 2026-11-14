@@ -308,6 +308,35 @@ impl Pile {
         }
     }
 
+    /// Where this pile sits on the shared board.
+    ///
+    /// The board numbers the top row left to right and the columns left to
+    /// right; this is the only place the game's names and the board's places
+    /// are tied together, so there is one answer rather than two.
+    #[must_use]
+    pub fn place(self) -> crate::board::Place {
+        match self {
+            Self::Stock => crate::board::Place::Top(0),
+            Self::Waste => crate::board::Place::Top(1),
+            Self::Foundation(index) => crate::board::Place::Top(2 + index),
+            Self::Tableau(index) => crate::board::Place::Column(index),
+        }
+    }
+
+    /// The pile a board place means, if this game has one there.
+    #[must_use]
+    pub fn from_place(place: crate::board::Place) -> Option<Self> {
+        match place {
+            crate::board::Place::Top(0) => Some(Self::Stock),
+            crate::board::Place::Top(1) => Some(Self::Waste),
+            crate::board::Place::Top(index) if index < 2 + FOUNDATIONS => {
+                Some(Self::Foundation(index - 2))
+            }
+            crate::board::Place::Column(index) if index < COLUMNS => Some(Self::Tableau(index)),
+            _ => None,
+        }
+    }
+
     /// A pile from its DOM token, rejecting anything out of range.
     #[must_use]
     pub fn from_slug(slug: &str) -> Option<Self> {
@@ -392,7 +421,10 @@ pub struct Report {
 }
 
 impl Report {
-    fn quiet(words: impl Into<String>) -> Self {
+    /// A report with nothing to shout about. Used by the page for the cases
+    /// where a press means nothing at all.
+    #[must_use]
+    pub fn quiet(words: impl Into<String>) -> Self {
         Self {
             won: false,
             words: words.into(),
@@ -2136,5 +2168,39 @@ mod tests {
     fn the_clock_grows_an_hour_field_only_when_it_needs_one() {
         assert_eq!(clock_text(3_599), "59:59");
         assert_eq!(clock_text(3_600), "1:00:00");
+    }
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::*;
+    use crate::board::Place;
+
+    #[test]
+    fn every_pile_round_trips_through_its_board_place() {
+        for pile in Pile::ALL {
+            assert_eq!(Pile::from_place(pile.place()), Some(pile), "{pile:?}");
+        }
+    }
+
+    #[test]
+    fn a_place_this_game_does_not_have_is_refused() {
+        assert_eq!(Pile::from_place(Place::Top(2 + FOUNDATIONS)), None);
+        assert_eq!(Pile::from_place(Place::Column(COLUMNS)), None);
+        assert_eq!(Pile::from_place(Place::Top(99)), None);
+    }
+
+    #[test]
+    fn the_top_row_is_read_left_to_right_and_the_columns_after_it() {
+        assert_eq!(Pile::Stock.place(), Place::Top(0));
+        assert_eq!(Pile::Waste.place(), Place::Top(1));
+        assert_eq!(Pile::Foundation(0).place(), Place::Top(2));
+        assert_eq!(Pile::Tableau(0).place(), Place::Column(0));
+        // The board's reading order is the top row then the columns, which is
+        // what the keyboard walks.
+        let mut places: Vec<Place> = Pile::ALL.iter().map(|pile| pile.place()).collect();
+        places.sort_unstable();
+        assert_eq!(places.first(), Some(&Place::Top(0)));
+        assert_eq!(places.last(), Some(&Place::Column(COLUMNS - 1)));
     }
 }
