@@ -1,63 +1,26 @@
-//! The browser layer: the only file that talks to the DOM.
+//! Klondike, as the shared page sees it.
 //!
-//! Every decision — which cards a run may contain, what a move scores, what the
-//! clock says, what can be undone — was made in [`crate::game`] and is unit
-//! tested there. What is left here is element handles, geometry, listeners and
-//! timers.
+//! The board is [`crate::board_ui`] and the shell around it is [`crate::shell`];
+//! both are carried byte for byte by Spider Solitaire. What is left here is the
+//! only thing that is Klondike's own: how a [`Scene`] is built from this game,
+//! and what each [`Intent`] means in its rules.
 //!
-//! Three rules keep this file from becoming the game:
-//!
-//! * **The board is built once and then only described.** The 52 cards and the
-//!   13 places are elements with stable identities; a render moves them by
-//!   transform and rewrites their description. Rebuilding the board would throw
-//!   away focus and kill a drag in progress, and the CSS transition that makes a
-//!   card fly to its pile depends on the element surviving the move.
-//! * **One listener per board, not one per card.** A click is read off the
-//!   element it landed on, and the element says which pile and position it is.
-//! * **The clock redraws the clock.** A passing second changes one line, so
-//!   [`App::tick`] paints the facts and leaves the board alone.
-
-use std::cell::{Cell, RefCell};
-use std::rc::Rc;
+//! No decision lives here. Every rule — what a move is worth, what may be
+//! picked up, what the page says — is in [`crate::game`], which is where the
+//! tests are.
 
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
-use wasm_bindgen_futures::{spawn_local, JsFuture};
-use web_sys::{
-    Document, Element, Event, HtmlButtonElement, HtmlElement, HtmlInputElement, HtmlSelectElement,
-    KeyboardEvent, MouseEvent, PointerEvent, Storage, Window,
-};
 
+use crate::board::{Fan, Place, Scene, Slot};
+use crate::board_ui::Intent;
+use crate::card::deck;
 use crate::game::{
-    Difficulty, Game, Hint, Options, Pile, Report, Scoring, COLUMNS, OPTIONS_KEY, STORAGE_KEY,
+    Difficulty, Game, Hint, Options, Pile, Report, Scoring, COLUMNS, FOUNDATIONS, OPTIONS_KEY,
+    STORAGE_KEY,
 };
-
-/// The app's whole mutable state, and the element handles it writes through.
-type Shared = Rc<RefCell<App>>;
-
-/// The scope this app's worker is registered for.
-const SCOPE: &str = "./";
-
-/// How often the clock is checked. It is a check, not a tick: the elapsed time
-/// comes from the wall clock, so a tab the browser throttled still catches up.
-const TICK_MS: i32 = 1_000;
-
-/// How far a finger may drift, in CSS pixels, before a press becomes a drag.
-const DRAG_SLOP: f64 = 6.0;
-
-/// How close two taps must be, in milliseconds, to count as a double tap.
-const DOUBLE_TAP_MS: f64 = 320.0;
-
-/// How long a hint stays lit.
-const HINT_MS: i32 = 2_600;
-
-/// How often the automatic finish moves one card.
-const AUTO_MS: i32 = 140;
+use crate::shell::{fresh_seed, Repeat, Rules};
 
 /// Start the app.
-///
-/// Runs automatically when the page's dynamic import resolves, because the
-/// loader in `ui.html` is `import('./app.js').then(m => m.default())`.
 ///
 /// # Errors
 ///
@@ -71,1735 +34,337 @@ pub fn start() -> Result<(), JsValue> {
     let board = document
         .get_element_by_id("board")
         .ok_or_else(|| JsValue::from_str("no #board"))?;
-    let wrap = board
-        .parent_element()
-        .ok_or_else(|| JsValue::from_str("no board wrap"))?;
-
-    let shared: Shared = Rc::new(RefCell::new(App::build(&window, &document, board, wrap)?));
-    {
-        let mut app = shared.borrow_mut();
-        app.paint();
-        if app.game.won() {
-            app.show_win();
-        }
-    }
-    bind(&window, &document, &shared);
-    observe_resize(&window, &shared);
-    start_clock(&window, &shared);
-    release_instant_layout(&window, &shared);
-
-    // By value: the future outlives this function, so it has to own what it
-    // holds. The same rule the event closures follow.
-    let offline = window.clone();
-    spawn_local(keep_offline(offline));
-    Ok(())
+    crate::shell::Shell::start(&window, &document, board, Klondike::default())
 }
 
-/// Everything one running app holds.
-struct App {
-    window: Window,
-    document: Document,
-    board: Element,
-    wrap: Element,
+/// The game, plus the only two things the page keeps beside it: the next deal's
+/// options, and the hint being shown.
+struct Klondike {
     game: Game,
     options: Options,
-    /// One button per physical card, indexed by the deck's own index.
-    cards: Vec<HtmlButtonElement>,
-    /// One place per pile, in `Pile::ALL` order.
-    slots: Vec<(Pile, HtmlButtonElement)>,
-    geometry: Geometry,
-    focus: Focus,
-    drag: Option<Drag>,
-    last_tap: Option<Tap>,
     hint: Option<Hint>,
-    hint_token: u32,
-    auto: Option<i32>,
-    /// Fractional seconds measured but not yet handed to the game.
-    pending: Cell<f64>,
-    /// The elapsed time at which the saved game is written again.
-    next_save: Cell<u32>,
+    /// What the game last said, waiting to be shown.
+    words: Option<String>,
 }
 
-/// Where the keyboard is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Focus {
-    pile: Pile,
-    /// `None` is the empty place itself.
-    index: Option<usize>,
-}
-
-/// The last tap, for recognising a double tap without relying on `dblclick`
-/// (which a touch screen does not reliably send).
-#[derive(Debug, Clone, Copy)]
-struct Tap {
-    pile: Pile,
-    index: usize,
-    at: f64,
-}
-
-/// A press that may become a drag.
-#[derive(Debug, Clone)]
-struct Drag {
-    id: i32,
-    pile: Pile,
-    index: usize,
-    start_x: f64,
-    start_y: f64,
-    x: f64,
-    y: f64,
-    active: bool,
-    /// The cards lifted, in pile order.
-    cards: Vec<u16>,
-    target: Option<Element>,
-}
-
-/// The board's layout for the current size, in board-local pixels.
-#[derive(Debug, Clone)]
-struct Geometry {
-    cw: f64,
-    ch: f64,
-    /// A position per deck index.
-    positions: Vec<(f64, f64)>,
-    /// A position per pile, in `Pile::ALL` order.
-    slots: Vec<(f64, f64)>,
-}
-
-impl Geometry {
-    fn empty(deck: usize) -> Self {
+impl Default for Klondike {
+    fn default() -> Self {
         Self {
-            cw: 0.0,
-            ch: 0.0,
-            positions: vec![(0.0, 0.0); deck],
-            slots: vec![(0.0, 0.0); Pile::ALL.len()],
+            game: Game::new(Options::default().difficulty, Options::default().scoring, 0),
+            options: Options::default(),
+            hint: None,
+            words: None,
         }
     }
 }
 
-impl App {
-    fn build(
-        window: &Window,
-        document: &Document,
-        board: Element,
-        wrap: Element,
-    ) -> Result<Self, JsValue> {
-        let stored_options = read(window, OPTIONS_KEY);
-        let options = stored_options
-            .as_deref()
-            .map(|text| Options::from_stored(Some(text)));
+impl Klondike {
+    /// The pile a board place means, if this game has one there.
+    fn pile(place: Place) -> Option<Pile> {
+        Pile::from_place(place)
+    }
 
-        let stored_game = read(window, STORAGE_KEY);
-        let game = Game::from_stored(stored_game.as_deref());
-        let options = match (options, &game) {
-            (Some(options), _) => options,
-            (None, Some(game)) => Options {
-                difficulty: game.difficulty(),
-                scoring: game.scoring(),
-            },
-            (None, None) => Options::default(),
+    /// Answer one gesture with the game's rules.
+    fn answer(&mut self, intent: Intent) -> Report {
+        match intent {
+            Intent::Tap { place, index } => self.tap(place, index),
+            Intent::DoubleTap { place, index } => self.double_tap(place, index),
+            Intent::Drop { from, index, to } => self.drop(from, index, to),
+            Intent::Back => self.game.clear_selection(),
+            Intent::Cancelled => Report::quiet(""),
+        }
+    }
+
+    fn tap(&mut self, place: Place, index: Option<usize>) -> Report {
+        let Some(pile) = Self::pile(place) else {
+            return Report::quiet("");
         };
-        let game =
-            game.unwrap_or_else(|| Game::new(options.difficulty, options.scoring, fresh_seed()));
-
-        let mut app = Self {
-            window: window.clone(),
-            document: document.clone(),
-            board,
-            wrap,
-            game,
-            options,
-            cards: Vec::new(),
-            slots: Vec::new(),
-            geometry: Geometry::empty(0),
-            focus: Focus {
-                pile: Pile::Stock,
-                index: None,
-            },
-            drag: None,
-            last_tap: None,
-            hint: None,
-            hint_token: 0,
-            auto: None,
-            pending: Cell::new(0.0),
-            next_save: Cell::new(10),
-        };
-        app.next_save.set(app.game.elapsed().saturating_add(10));
-        app.build_board()?;
-        app.focus = app.default_focus();
-        Ok(app)
-    }
-
-    /// Create the places and the deck, once.
-    ///
-    /// The markup is generated from the same card model the rules use, and
-    /// nothing a reader typed reaches it: ranks, suits and fixed class names
-    /// only, which is why it needs no escaping.
-    fn build_board(&mut self) -> Result<(), JsValue> {
-        for pile in Pile::ALL {
-            let slot: HtmlButtonElement = self.document.create_element("button")?.dyn_into()?;
-            slot.set_attribute("type", "button")?;
-            slot.set_class_name("slot");
-            slot.set_attribute("data-pile", &pile.slug())?;
-            slot.set_attribute("aria-label", &self.game.pile_label(pile))?;
-            self.board.append_child(&slot)?;
-            self.slots.push((pile, slot));
-        }
-
-        for id in 0..self.game.deck_len() {
-            let card = self.game.card(u16::try_from(id).unwrap_or(0));
-            let element: HtmlButtonElement = self.document.create_element("button")?.dyn_into()?;
-            element.set_attribute("type", "button")?;
-            element.set_class_name(&format!("card {}", card.suit.class()));
-            element.set_attribute("data-card", &id.to_string())?;
-            element.set_attribute("data-rank", card.rank.short())?;
-            element.set_inner_html(&card_html(card));
-            self.board.append_child(&element)?;
-            self.cards.push(element);
-        }
-        Ok(())
-    }
-
-    // -- painting --------------------------------------------------------
-
-    /// Draw the whole app from the state.
-    fn paint(&mut self) {
-        self.normalise_focus();
-        self.geometry = self.compute_geometry();
-        let _ = self.board.set_attribute(
-            "style",
-            &format!("--cw:{}px;--ch:{}px", self.geometry.cw, self.geometry.ch),
-        );
-        self.paint_cards();
-        self.paint_slots();
-        self.paint_facts();
-        self.paint_tools();
-        self.paint_menu();
-        self.paint_won();
-    }
-
-    /// Compute where every card and place sits for the current box.
-    ///
-    /// Width decides the card; height may shrink it, and the fan inside each
-    /// column is compressed to fit whatever height is left. That is the whole
-    /// responsive strategy: one card size, one set of positions, no CSS
-    /// breakpoints that would need a second copy of the layout.
-    fn compute_geometry(&self) -> Geometry {
-        let deck = self.cards.len();
-        let width = f64::from(self.wrap.client_width());
-        let height = f64::from(self.wrap.client_height());
-        if width <= 1.0 || height <= 1.0 {
-            return Geometry::empty(deck);
-        }
-
-        let margin = (width * 0.012).clamp(4.0, 12.0);
-        let usable = (width - margin * 2.0).max(1.0);
-        let gap = (usable * 0.008).clamp(3.0, 10.0);
-        let columns = COLUMNS as f64;
-        let width_card = (usable - gap * (columns - 1.0)) / columns;
-
-        // The vertical budget: the top row, a small gap, the first card of a
-        // tableau column, and the fan below it — all measured in card widths,
-        // because every one of them is a multiple of the card's own width.
-        //
-        // The fan is measured from the tallest column in *this* deal rather
-        // than reserved as a constant. A constant fits the opening deal and then
-        // squeezes a column of twenty cards until every rank hides behind the
-        // next one; measuring the deal makes the whole board's cards smaller
-        // instead, which is a board the player can still read.
-        //
-        // The size is then clamped, and the clamp is what keeps a very long
-        // column playable. Below `MIN_SCALE` of the width-driven size the cards
-        // stop shrinking and the fan compresses instead: a small card with a
-        // visible rank corner is readable, a board of stamp-sized cards is not.
-        const ASPECT: f64 = 1.45;
-        const DOWN_FAN: f64 = 0.13;
-        const UP_FAN: f64 = 0.30;
-        const ROW_GAP: f64 = 0.13;
-        const MIN_SCALE: f64 = 0.55;
-
-        let (down_gaps, up_gaps) = self.longest_fan();
-        let fan = down_gaps as f64 * DOWN_FAN + up_gaps as f64 * UP_FAN;
-        let vertical = (height - margin * 2.0).max(1.0);
-        let solve = vertical / (ASPECT * (2.0 + ROW_GAP + fan));
-        let cw = width_card.min(solve).max(width_card * MIN_SCALE).max(8.0);
-        let ch = cw * ASPECT;
-        let total = cw * columns + gap * (columns - 1.0);
-        let x0 = (width - total) / 2.0;
-        let top_y = margin;
-        let tableau_y = top_y + ch + (ch * ROW_GAP).max(6.0);
-        let tableau_room = (height - tableau_y - ch - margin).max(0.0);
-        let column_x = |column: usize| x0 + column as f64 * (cw + gap);
-
-        let mut positions = vec![(0.0, 0.0); deck];
-        let mut slots = vec![(0.0, 0.0); Pile::ALL.len()];
-
-        for (slot_index, pile) in Pile::ALL.into_iter().enumerate() {
-            let (x, y) = match pile {
-                Pile::Stock => (column_x(0), top_y),
-                Pile::Waste => (column_x(1), top_y),
-                Pile::Foundation(index) => (column_x(3 + index), top_y),
-                Pile::Tableau(index) => (column_x(index), tableau_y),
-            };
-            slots[slot_index] = (x, y);
-
-            let cards = self.game.pile(pile);
-            match pile {
-                Pile::Stock | Pile::Foundation(_) => {
-                    for &id in cards {
-                        positions[id as usize] = (x, y);
-                    }
-                }
-                Pile::Waste => {
-                    // The three cards a draw-three turn exposed are fanned so
-                    // the player can see and reach each of them; everything
-                    // deeper is under them.
-                    let shown = if self.game.difficulty().draw() == 3 {
-                        3
-                    } else {
-                        1
-                    };
-                    let fan = cards.len().saturating_sub(shown);
-                    for (index, &id) in cards.iter().enumerate() {
-                        let offset = index.saturating_sub(fan) as f64 * cw * 0.26;
-                        positions[id as usize] = (x + offset.min(cw * 0.55), y);
-                    }
-                }
-                Pile::Tableau(_) => {
-                    let up = first_face_up(&self.game, pile);
-                    let base_down = ch * DOWN_FAN;
-                    let base_up = ch * UP_FAN;
-                    // Two passes, and the second one is what guarantees the
-                    // column fits. The first compresses the natural fan into
-                    // the room available; the second brings a column that is
-                    // still too tall down to size *while keeping the face-up
-                    // cards further apart than the face-down ones*. Without it
-                    // a long column simply runs off the bottom of the board and
-                    // is clipped, which hides cards the player needs.
-                    let weights: Vec<f64> = (1..cards.len())
-                        .map(|position| {
-                            if position - 1 < up {
-                                base_down
-                            } else {
-                                base_up
-                            }
-                        })
-                        .collect();
-                    let natural: f64 = weights.iter().sum();
-                    let first = if natural > tableau_room && natural > 0.0 {
-                        tableau_room / natural
-                    } else {
-                        1.0
-                    };
-                    // Even a squeezed column keeps a readable edge on each card:
-                    // a face-up card below `.09ch` apart is one pile of rank
-                    // glyphs, and a face-down one below `.055ch` is a smear.
-                    let mut gaps: Vec<f64> = weights
-                        .iter()
-                        .map(|weight| {
-                            if *weight == base_down {
-                                (weight * first).max(ch * 0.055)
-                            } else {
-                                (weight * first).max(ch * 0.09)
-                            }
-                        })
-                        .collect();
-                    let total: f64 = gaps.iter().sum();
-                    if total > tableau_room && total > 0.0 {
-                        let second = tableau_room / total;
-                        for gap in &mut gaps {
-                            *gap *= second;
-                        }
-                    }
-                    let mut offset = 0.0;
-                    for (position, &id) in cards.iter().enumerate() {
-                        if position > 0 {
-                            offset += gaps.get(position - 1).copied().unwrap_or(0.0);
-                        }
-                        positions[id as usize] = (x, y + offset);
-                    }
-                }
-            }
-        }
-
-        Geometry {
-            cw,
-            ch,
-            positions,
-            slots,
-        }
-    }
-
-    /// The fan of the deal's tallest column: face-down gaps, face-up gaps.
-    ///
-    /// Only the number of gaps matters; where the column is drawn does not, so
-    /// this answers the one question the vertical budget asks.
-    fn longest_fan(&self) -> (usize, usize) {
-        let mut best: (usize, usize, usize) = (0, 0, 0);
-        for column in 0..COLUMNS {
-            let pile = Pile::Tableau(column);
-            let down = first_face_up(&self.game, pile);
-            let up = self.game.pile_len(pile).saturating_sub(down);
-            let weight = down + up;
-            if weight > best.0 {
-                best = (weight, down, up);
-            }
-        }
-        let (_, down, up) = best;
-        (down.saturating_sub(1), up.saturating_sub(1))
-    }
-
-    fn paint_cards(&mut self) {
-        let mut locations: Vec<Option<(Pile, usize)>> = vec![None; self.cards.len()];
-        for pile in Pile::ALL {
-            for (index, &id) in self.game.pile(pile).iter().enumerate() {
-                if let Some(slot) = locations.get_mut(id as usize) {
-                    *slot = Some((pile, index));
-                }
-            }
-        }
-
-        let selection = self.game.selection();
-        let focus_card = self.focus_card_id();
-        let dragging: Vec<u16> = self
-            .drag
-            .as_ref()
-            .filter(|drag| drag.active)
-            .map(|drag| drag.cards.clone())
-            .unwrap_or_default();
-
-        for (id, location) in locations.iter().enumerate() {
-            let Some((pile, index)) = *location else {
-                continue;
-            };
-            let Some(element) = self.cards.get(id) else {
-                continue;
-            };
-            let face_down = self.game.is_face_down(pile, index);
-            let (x, y) = self
-                .geometry
-                .positions
-                .get(id)
-                .copied()
-                .unwrap_or((0.0, 0.0));
-            let z = z_index(pile, index);
-            let selected = selection.is_some_and(|held| held.pile == pile && index >= held.index);
-            let hinted = match &self.hint {
-                Some(Hint::Move {
-                    from,
-                    index: start,
-                    count,
-                    ..
-                }) => *from == pile && index >= *start && index < *start + *count,
-                _ => false,
-            };
-            let focused = focus_card == Some(u16::try_from(id).unwrap_or(0));
-            let is_dragging = dragging.contains(&u16::try_from(id).unwrap_or(0));
-
-            let mut classes = format!(
-                "card {}",
-                self.game.card(u16::try_from(id).unwrap_or(0)).suit.class()
-            );
-            if face_down {
-                classes.push_str(" down");
-            }
-            if selected {
-                classes.push_str(" selected");
-            }
-            if hinted {
-                classes.push_str(" hinted");
-            }
-            if focused {
-                classes.push_str(" focused");
-            }
-            if is_dragging {
-                classes.push_str(" dragging");
-            }
-            element.set_class_name(&classes);
-            let _ = element.set_attribute("style", &format!("left:{x}px;top:{y}px;z-index:{z}"));
-            let _ = element.set_attribute("data-pile", &pile.slug());
-            let _ = element.set_attribute("data-index", &index.to_string());
-
-            let tab = if focused { "0" } else { "-1" };
-            let _ = element.set_attribute("tabindex", tab);
-
-            if face_down {
-                // The stock is a control even though its top card is face
-                // down: it is the one pile whose whole purpose is the press.
-                if pile == Pile::Stock && focused {
-                    let _ = element.remove_attribute("aria-hidden");
-                    let _ = element.set_attribute(
-                        "aria-label",
-                        &format!("{}, turn over.", self.game.pile_label(pile)),
-                    );
-                } else {
-                    let _ = element.set_attribute("aria-hidden", "true");
-                    let _ = element.remove_attribute("aria-label");
-                }
-            } else {
-                let _ = element.remove_attribute("aria-hidden");
-                let card = self.game.card(u16::try_from(id).unwrap_or(0));
-                let mut label = format!(
-                    "{} in {}, card {} of {}.",
-                    card.name(),
-                    pile.name(),
-                    index + 1,
-                    self.game.pile_len(pile)
-                );
-                if selected {
-                    label.push_str(" Selected.");
-                }
-                let _ = element.set_attribute("aria-label", &label);
-            }
-        }
-    }
-
-    fn paint_slots(&mut self) {
-        for (slot_index, (pile, element)) in self.slots.iter().enumerate() {
-            let (x, y) = self
-                .geometry
-                .slots
-                .get(slot_index)
-                .copied()
-                .unwrap_or((0.0, 0.0));
-            let empty = self.game.pile_len(*pile) == 0;
-            let hinted = match &self.hint {
-                Some(Hint::Move { to, .. }) => to == pile,
-                Some(Hint::Draw { .. } | Hint::Recycle { .. }) => *pile == Pile::Stock,
-                _ => false,
-            };
-            let focused = self.focus.pile == *pile && self.focus.index.is_none();
-            let mut classes = String::from("slot");
-            if !empty {
-                classes.push_str(" filled");
-            }
-            if hinted {
-                classes.push_str(" hinted");
-            }
-            element.set_class_name(&classes);
-            let _ = element.set_attribute(
-                "style",
-                &format!("transform:translate({x}px,{y}px);z-index:1"),
-            );
-            let _ = element.set_attribute("data-index", &self.game.pile_len(*pile).to_string());
-            let _ = element.set_attribute("tabindex", if focused { "0" } else { "-1" });
-            let _ = element.set_attribute("aria-label", &self.game.pile_label(*pile));
-            element.set_text_content(Some(self.game.slot_mark(*pile)));
-        }
-    }
-
-    fn paint_facts(&self) {
-        let readout = self.game.readout();
-        set_text(&self.document, "clock", &readout.clock);
-        set_text(&self.document, "moves", &readout.moves);
-        if let Some(score) = readout.score {
-            set_text(&self.document, "score", &score);
-            set_hidden(&self.document, "score-fact", false);
-        } else {
-            set_hidden(&self.document, "score-fact", true);
-        }
-    }
-
-    fn paint_tools(&self) {
-        let won = self.game.won();
-        if let Some(undo) = button(&self.document, "undo") {
-            undo.set_disabled(won || !self.game.can_undo());
-        }
-        if let Some(hint) = button(&self.document, "hint") {
-            hint.set_disabled(won);
-        }
-        if let Some(auto) = button(&self.document, "auto") {
-            auto.set_disabled(won || !self.game.can_autocomplete());
-        }
-    }
-
-    fn paint_menu(&self) {
-        set_text(&self.document, "variant", &self.game.variant());
-        set_text(&self.document, "game-summary", &self.game.summary());
-        set_text(
-            &self.document,
-            "difficulty-note",
-            self.options.difficulty.sentence(),
-        );
-        set_text(
-            &self.document,
-            "scoring-note",
-            self.options.scoring.sentence(),
-        );
-        set_select(&self.document, "difficulty", self.options.difficulty.slug());
-        set_select(&self.document, "scoring", self.options.scoring.slug());
-    }
-
-    fn paint_won(&self) {
-        let won = self.game.won();
-        set_hidden(&self.document, "won", !won);
-        if won {
-            set_text(&self.document, "won-detail", &self.game.result_words());
-        }
-    }
-
-    // -- actions ---------------------------------------------------------
-
-    /// A tap (or a keyboard activation) on a card or a place.
-    fn tap_at(&mut self, pile: Pile, index: usize) {
-        self.clear_hint();
         if pile == Pile::Stock {
-            self.last_tap = None;
-            let report = self.game.draw();
-            self.focus = self.top_focus(Pile::Stock);
-            self.after(report);
-            self.focus_element();
-            return;
+            return self.game.draw();
         }
+        match index {
+            Some(index) => self.game.tap(pile, index),
+            // An empty place: a press on it is a destination for whatever is in
+            // hand, and nothing more.
+            None if self.game.selection().is_some() => self.game.drop(pile),
+            None => Report::quiet(""),
+        }
+    }
 
-        let now = js_sys::Date::now();
-        let double = self.last_tap.is_some_and(|tap| {
-            tap.pile == pile && tap.index == index && now - tap.at < DOUBLE_TAP_MS
-        });
-        self.last_tap = if double {
-            None
-        } else {
-            Some(Tap {
-                pile,
-                index,
-                at: now,
-            })
+    fn double_tap(&mut self, place: Place, index: Option<usize>) -> Report {
+        let (Some(pile), Some(index)) = (Self::pile(place), index) else {
+            return Report::quiet("");
         };
-        let report = if double {
-            self.game.double_tap(pile, index)
-        } else {
-            self.game.tap(pile, index)
+        self.game.double_tap(pile, index)
+    }
+
+    /// A drag: take the run up in the rules, then put it down where the player
+    /// did.
+    ///
+    /// The two steps are separate because they are separate questions — "may
+    /// this run move" and "does this pile take it" — and the game answers each
+    /// with the rule a tap uses, so a drag and a tap can never disagree about
+    /// what is legal.
+    fn drop(&mut self, from: Place, index: usize, to: Place) -> Report {
+        let (Some(from), Some(to)) = (Self::pile(from), Self::pile(to)) else {
+            return Report::quiet("");
         };
-        self.focus = match self.game.selection() {
-            Some(held) => Focus {
-                pile: held.pile,
-                index: Some(held.index),
-            },
-            None => self.top_focus(pile),
+        self.game.select(from, index);
+        self.game.drop(to)
+    }
+
+    /// One card of the automatic finish. The shell repeats this until it says
+    /// the board is done, so no timer handle is ever held here.
+    fn auto_step(&mut self) -> Repeat {
+        let Some(report) = self.game.autocomplete_step() else {
+            return Repeat::Once;
         };
-        self.after(report);
-        self.focus_element();
-    }
-
-    fn draw_action(&mut self) {
-        self.clear_hint();
-        let report = self.game.draw();
-        self.focus = self.top_focus(Pile::Stock);
-        self.after(report);
-        self.focus_element();
-    }
-
-    fn undo_action(&mut self) {
-        self.stop_auto();
-        self.clear_hint();
-        let report = self.game.undo();
-        self.focus = self.top_focus(self.focus.pile);
-        self.after(report);
-        self.focus_element();
-    }
-
-    fn new_game(&mut self, restart: bool) {
-        self.stop_auto();
-        self.hint = None;
-        self.last_tap = None;
-        self.drag = None;
-        self.game = if restart {
-            self.game.restart()
-        } else {
-            Game::dealt(self.options.difficulty, self.options.scoring, fresh_seed())
-        };
-        self.focus = self.default_focus();
-        self.next_save.set(self.game.elapsed().saturating_add(10));
-        close_menu(&self.document);
-        self.paint();
-        let words = if restart {
-            "Restarted the same deal.".to_owned()
-        } else {
-            format!("New deal. {}", self.options.summary())
-        };
-        self.say(&words);
-        self.save_game();
-        self.save_options();
-        self.focus_element();
-    }
-
-    /// Finish a board that is only waiting for its cards to be sent home.
-    fn start_auto(shared: &Shared) {
-        let mut app = shared.borrow_mut();
-        if app.auto.is_some() || !app.game.can_autocomplete() {
-            return;
-        }
-        let Some(window) = web_sys::window() else {
-            return;
-        };
-        let reused = Rc::clone(shared);
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            let mut app = reused.borrow_mut();
-            let Some(report) = app.game.autocomplete_step() else {
-                app.stop_auto();
-                app.paint_tools();
-                return;
-            };
-            let won = report.won;
-            app.after(report);
-            if won {
-                app.stop_auto();
-            }
-        });
-        match window.set_interval_with_callback_and_timeout_and_arguments_0(
-            closure.as_ref().unchecked_ref(),
-            AUTO_MS,
-        ) {
-            Ok(handle) => app.auto = Some(handle),
-            Err(error) => warn("could not start the automatic finish", &error),
-        }
-        closure.forget();
-    }
-
-    fn stop_auto(&mut self) {
-        if let Some(handle) = self.auto.take() {
-            self.window.clear_interval_with_handle(handle);
-        }
-    }
-
-    fn after(&mut self, report: Report) {
-        if report.won {
-            // The dialog carries the result; the line under the board says only
-            // that the deal is over. Printing the whole result twice on one
-            // screen is the kind of duplication that makes both copies look
-            // like decoration.
-            self.say("Deal complete.");
-        } else if !report.words.is_empty() {
-            self.say(&report.words);
-        }
-        self.paint();
-        if report.won {
-            self.show_win();
-        }
-        self.save_game();
-    }
-
-    fn show_win(&mut self) {
-        set_hidden(&self.document, "won", false);
-        set_text(&self.document, "won-detail", &self.game.result_words());
-        if let Some(new) = button(&self.document, "won-new") {
-            let _ = new.focus();
-        }
-    }
-
-    fn tick(&mut self, seconds: u32) {
+        self.show(report);
         if self.game.won() {
-            return;
-        }
-        self.game.tick(seconds);
-        self.paint_facts();
-        if self.game.started() && self.game.elapsed() >= self.next_save.get() {
-            self.next_save.set(self.game.elapsed().saturating_add(10));
-            self.save_game();
+            Repeat::Once
+        } else {
+            Repeat::Every(140)
         }
     }
+}
 
-    // -- focus -----------------------------------------------------------
+/// How a pile is drawn.
+fn fan_for(game: &Game, pile: Pile) -> Fan {
+    match pile {
+        Pile::Tableau(_) => Fan::COLUMN,
+        // The cards a draw-three turn exposed are fanned so the player can see
+        // and reach each; everything deeper is under them.
+        Pile::Waste => Fan::tail(game.difficulty().draw().clamp(1, 3)),
+        Pile::Stock | Pile::Foundation(_) => Fan::PACKET,
+    }
+}
 
-    fn default_focus(&self) -> Focus {
-        if self.game.pile_len(Pile::Stock) > 0 {
-            return Focus {
-                pile: Pile::Stock,
-                index: Some(self.game.pile_len(Pile::Stock) - 1),
-            };
-        }
-        for column in 0..COLUMNS {
-            let pile = Pile::Tableau(column);
-            if first_face_up(&self.game, pile) < self.game.pile_len(pile) {
-                return Focus {
-                    pile,
-                    index: Some(self.game.pile_len(pile) - 1),
-                };
-            }
-        }
-        Focus {
-            pile: Pile::Tableau(0),
-            index: None,
+/// Where the keyboard should be: the stock while it has cards, else the first
+/// column with a card that can be picked up.
+fn default_focus(game: &Game) -> (Place, Option<usize>) {
+    if game.pile_len(Pile::Stock) > 0 {
+        return (Pile::Stock.place(), Some(game.pile_len(Pile::Stock) - 1));
+    }
+    for column in 0..COLUMNS {
+        let pile = Pile::Tableau(column);
+        let len = game.pile_len(pile);
+        if let Some(index) = (0..len)
+            .rev()
+            .find(|&index| !game.is_face_down(pile, index))
+        {
+            return (pile.place(), Some(index));
         }
     }
+    (Pile::Tableau(0).place(), None)
+}
 
-    fn top_focus(&self, pile: Pile) -> Focus {
-        let len = self.game.pile_len(pile);
-        if len == 0 {
-            return Focus { pile, index: None };
-        }
-        match pile {
-            Pile::Tableau(_) if first_face_up(&self.game, pile) >= len => {
-                Focus { pile, index: None }
-            }
-            _ => Focus {
-                pile,
-                index: Some(len - 1),
-            },
-        }
+impl Rules for Klondike {
+    fn deck(&self) -> Vec<crate::card::Card> {
+        deck()
     }
 
-    fn focus_card_id(&self) -> Option<u16> {
-        let index = self.focus.index?;
-        self.game.pile(self.focus.pile).get(index).copied()
-    }
-
-    fn focus_element(&self) {
-        if let Some(id) = self.focus_card_id() {
-            if let Some(card) = self.cards.get(id as usize) {
-                let _ = card.focus();
-            }
-            return;
-        }
-        if let Some((_, slot)) = self.slots.iter().find(|(pile, _)| *pile == self.focus.pile) {
-            let _ = slot.focus();
-        }
-    }
-
-    fn normalise_focus(&mut self) {
-        let valid = match self.focus.pile {
-            Pile::Stock => match self.focus.index {
-                Some(index) => index < self.game.pile_len(Pile::Stock),
-                None => self.game.pile_len(Pile::Stock) == 0,
-            },
-            Pile::Waste | Pile::Foundation(_) => match self.focus.index {
-                Some(index) => index < self.game.pile_len(self.focus.pile),
-                None => self.game.pile_len(self.focus.pile) == 0,
-            },
-            Pile::Tableau(_) => match self.focus.index {
-                Some(index) => {
-                    index < self.game.pile_len(self.focus.pile)
-                        && !self.game.is_face_down(self.focus.pile, index)
-                }
-                None => {
-                    first_face_up(&self.game, self.focus.pile)
-                        >= self.game.pile_len(self.focus.pile)
-                }
-            },
-        };
-        if !valid {
-            self.focus = self.default_focus();
-        }
-    }
-
-    fn move_focus(&mut self, delta: i32) {
-        self.normalise_focus();
-        let current = Pile::ALL
-            .iter()
-            .position(|pile| *pile == self.focus.pile)
-            .unwrap_or(0);
-        let count = i32::try_from(Pile::ALL.len()).unwrap_or(1);
-        let next = (i32::try_from(current).unwrap_or(0) + delta).rem_euclid(count);
-        let pile = Pile::ALL[usize::try_from(next).unwrap_or(0)];
-        self.focus = self.top_focus(pile);
-        self.paint();
-        self.focus_element();
-    }
-
-    fn move_within(&mut self, delta: i32) {
-        let Pile::Tableau(_) = self.focus.pile else {
-            return;
-        };
-        let pile = self.focus.pile;
-        let len = self.game.pile_len(pile);
-        let up = first_face_up(&self.game, pile);
-        if up >= len {
-            return;
-        }
-        let current = self.focus.index.unwrap_or(len - 1).clamp(up, len - 1);
-        let current = i32::try_from(current).unwrap_or(0);
-        let low = i32::try_from(up).unwrap_or(0);
-        let high = i32::try_from(len - 1).unwrap_or(low);
-        let next = (current + delta).clamp(low, high);
-        self.focus = Focus {
-            pile,
-            index: Some(usize::try_from(next).unwrap_or(0)),
-        };
-        self.paint();
-        self.focus_element();
-    }
-
-    // -- pointer ---------------------------------------------------------
-
-    fn pointer_down(
-        &mut self,
-        id: i32,
-        pile: Pile,
-        index: usize,
-        x: f64,
-        y: f64,
-        target: Option<Element>,
-    ) {
-        if self.game.won() {
-            return;
-        }
-        self.clear_hint();
-        self.focus = Focus {
-            pile,
-            index: (index < self.game.pile_len(pile)).then_some(index),
-        };
-        self.last_tap = None;
-        self.drag = Some(Drag {
-            id,
-            pile,
-            index,
-            start_x: x,
-            start_y: y,
-            x,
-            y,
-            active: false,
-            cards: Vec::new(),
-            target,
-        });
-        self.paint();
-    }
-
-    fn pointer_moved(&mut self, id: i32, x: f64, y: f64) {
-        let Some(mut drag) = self.drag.clone() else {
-            return;
-        };
-        if drag.id != id {
-            return;
-        }
-        drag.x = x;
-        drag.y = y;
-        if !drag.active {
-            if (x - drag.start_x).hypot(y - drag.start_y) < DRAG_SLOP {
-                return;
-            }
-            if self
+    fn scene(&self) -> Scene {
+        let mut slots = Vec::with_capacity(Pile::ALL.len());
+        for pile in Pile::ALL {
+            let cards: Vec<(u16, bool)> = self
                 .game
-                .selection()
-                .is_some_and(|held| held.pile != drag.pile)
-            {
-                // A destination is already in hand; a press on another pile is
-                // a tap, not a second drag.
-                return;
+                .pile(pile)
+                .iter()
+                .enumerate()
+                .map(|(index, &id)| (id, self.game.is_face_down(pile, index)))
+                .collect();
+            let mut slot = Slot::new(
+                pile.place(),
+                fan_for(&self.game, pile),
+                self.game.pile_label(pile),
+            )
+            .with_mark(self.game.slot_mark(pile))
+            .with_cards(&cards);
+            if pile == Pile::Stock {
+                slot = slot.pressable();
             }
-            let Some(count) = self.game.run_len(drag.pile, drag.index) else {
-                return;
-            };
-            let report = self.game.select(drag.pile, drag.index);
-            if !report.words.is_empty() {
-                self.say(&report.words);
-            }
-            drag.cards = self.game.pile(drag.pile)[drag.index..drag.index + count].to_vec();
-            drag.active = true;
-            self.drag = Some(drag.clone());
-            self.paint();
+            slots.push(slot);
         }
-        self.drag = Some(drag.clone());
-        self.drag_visual(&drag);
+        let mut scene = Scene::new(slots, 2 + FOUNDATIONS);
+        scene.held = self
+            .game
+            .selection()
+            .map(|held| (held.pile.place(), held.index));
+        scene.hint = self.hint.as_ref().and_then(|hint| match hint {
+            Hint::Move {
+                from, index, count, ..
+            } => Some((from.place(), *index, *count)),
+            Hint::Draw { .. } | Hint::Recycle { .. } => Some((
+                Pile::Stock.place(),
+                self.game.pile_len(Pile::Stock).saturating_sub(1),
+                1,
+            )),
+            Hint::None { .. } => None,
+        });
+        scene
     }
 
-    fn pointer_up(&mut self, id: i32, x: f64, y: f64) {
-        if self.drag.as_ref().is_none_or(|drag| drag.id != id) {
-            return;
-        }
-        let Some(mut drag) = self.drag.take() else {
-            return;
-        };
-        if let Some(target) = drag.target.take() {
-            let _ = target.release_pointer_capture(drag.id);
-        }
-        if drag.active {
-            let to = self.drop_target(x, y);
-            let report = match to {
-                Some(to) => self.game.drop(to),
-                None => self.game.clear_selection(),
-            };
-            self.focus = to.map_or(self.focus, |pile| self.top_focus(pile));
-            self.after(report);
-            return;
-        }
-        self.tap_at(drag.pile, drag.index);
+    fn act(&mut self, intent: Intent) {
+        let report = self.answer(intent);
+        self.show(report);
     }
 
-    fn pointer_cancelled(&mut self, id: i32) {
-        if self.drag.as_ref().is_none_or(|drag| drag.id != id) {
-            return;
-        }
-        self.drag = None;
-        self.paint();
-    }
-
-    fn drag_visual(&self, drag: &Drag) {
-        let dx = drag.x - drag.start_x;
-        let dy = drag.y - drag.start_y;
-        for (offset, &id) in drag.cards.iter().enumerate() {
-            let Some(element) = self.cards.get(id as usize) else {
-                continue;
-            };
-            let (x, y) = self
-                .geometry
-                .positions
-                .get(id as usize)
-                .copied()
-                .unwrap_or((0.0, 0.0));
-            let z = 2_000 + i32::try_from(offset).unwrap_or(0);
-            let _ = element.set_attribute(
-                "style",
-                &format!("left:{}px;top:{}px;z-index:{z}", x + dx, y + dy),
-            );
+    fn lift(&self, place: Place, index: usize) -> usize {
+        match Self::pile(place) {
+            Some(pile) => self.game.run_len(pile, index).unwrap_or(0),
+            None => 0,
         }
     }
 
-    fn drop_target(&self, x: f64, y: f64) -> Option<Pile> {
-        let array = self
-            .document
-            .elements_from_point(f64_to_f32(x), f64_to_f32(y));
-        for value in array.iter() {
-            let Ok(element) = value.dyn_into::<Element>() else {
-                continue;
-            };
-            if let Some(pile) = pile_of_element(&element) {
-                return Some(pile);
-            }
-        }
-        None
+    fn default_focus(&self) -> (Place, Option<usize>) {
+        default_focus(&self.game)
     }
 
-    // -- hints and storage ----------------------------------------------
+    fn hint(&mut self) -> Option<String> {
+        if self.game.won() {
+            return None;
+        }
+        let hint = self.game.hint();
+        let words = hint.words().to_owned();
+        self.hint = Some(hint);
+        Some(words)
+    }
 
     fn clear_hint(&mut self) {
         self.hint = None;
     }
 
-    fn say(&self, words: &str) {
-        set_text(&self.document, "status", words);
+    fn won(&self) -> bool {
+        self.game.won()
     }
 
-    fn save_game(&self) {
-        let Some(storage) = storage(&self.window) else {
-            return;
-        };
-        match self.game.to_stored() {
-            Some(value) => {
-                if let Err(error) = storage.set_item(STORAGE_KEY, &value) {
-                    warn("could not save the game", &error);
-                }
+    fn result_words(&self) -> String {
+        self.game.result_words()
+    }
+
+    fn can_undo(&self) -> bool {
+        self.game.can_undo()
+    }
+
+    fn undo(&mut self) {
+        let report = self.game.undo();
+        self.show(report);
+    }
+
+    fn started(&self) -> bool {
+        self.game.started()
+    }
+
+    fn elapsed(&self) -> u32 {
+        self.game.elapsed()
+    }
+
+    fn tick(&mut self, seconds: u32) {
+        self.game.tick(seconds);
+    }
+
+    fn readout(&self) -> (String, String, Option<String>) {
+        let readout = self.game.readout();
+        (readout.clock, readout.moves, readout.score)
+    }
+
+    fn variant(&self) -> String {
+        self.game.variant()
+    }
+
+    fn summary(&self) -> String {
+        self.game.summary()
+    }
+
+    fn action_label(&self) -> Option<&'static str> {
+        Some("Finish")
+    }
+
+    fn action_enabled(&self) -> bool {
+        self.game.can_autocomplete()
+    }
+
+    fn action(&mut self) -> Repeat {
+        if !self.game.can_autocomplete() {
+            return Repeat::Once;
+        }
+        self.auto_step()
+    }
+
+    fn take_words(&mut self) -> Option<String> {
+        self.words.take()
+    }
+
+    fn option_values(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("difficulty", self.options.difficulty.slug().to_owned()),
+            ("scoring", self.options.scoring.slug().to_owned()),
+        ]
+    }
+
+    fn option_note(&self, id: &str) -> String {
+        match id {
+            "difficulty" => self.options.difficulty.sentence().to_owned(),
+            "scoring" => self.options.scoring.sentence().to_owned(),
+            _ => String::new(),
+        }
+    }
+
+    fn set_option(&mut self, id: &str, value: &str) {
+        match id {
+            "difficulty" => {
+                self.options.difficulty =
+                    Difficulty::from_slug(value).unwrap_or(Options::default().difficulty);
             }
-            None => {
-                let _ = storage.remove_item(STORAGE_KEY);
+            "scoring" => {
+                self.options.scoring = Scoring::from_slug(value).unwrap_or(Scoring::Standard);
             }
+            _ => {}
         }
     }
 
-    fn save_options(&self) {
-        let Some(storage) = storage(&self.window) else {
-            return;
-        };
-        if let Err(error) = storage.set_item(OPTIONS_KEY, &self.options.to_stored()) {
-            warn("could not save the options", &error);
-        }
-    }
-}
-
-// -- the board's vocabulary ----------------------------------------------
-
-fn card_html(card: crate::card::Card) -> String {
-    let rank = card.rank.short();
-    let suit = card.suit.symbol();
-    format!(
-        "<span class=\"face\">\
-           <span class=\"corner tl\"><span class=\"rank\">{rank}</span><span class=\"suit\">{suit}</span></span>\
-           <span class=\"pip\">{suit}</span>\
-           <span class=\"corner br\"><span class=\"rank\">{rank}</span><span class=\"suit\">{suit}</span></span>\
-         </span>\
-         <span class=\"back\"></span>"
-    )
-}
-
-fn z_index(pile: Pile, index: usize) -> i32 {
-    let base = i32::try_from(
-        Pile::ALL
-            .iter()
-            .position(|known| *known == pile)
-            .unwrap_or(0),
-    )
-    .unwrap_or(0);
-    20 + base * 70 + i32::try_from(index).unwrap_or(0)
-}
-
-/// The first face-up card in a column, or its length when every card is down.
-fn first_face_up(game: &Game, pile: Pile) -> usize {
-    let len = game.pile_len(pile);
-    (0..len)
-        .find(|&index| !game.is_face_down(pile, index))
-        .unwrap_or(len)
-}
-
-/// The pile an element belongs to, walking up to the card or place that names
-/// it. A dragging card is not a drop target, so its whole subtree is skipped.
-fn pile_of_element(element: &Element) -> Option<Pile> {
-    if element
-        .get_attribute("class")
-        .is_some_and(|classes| classes.split_whitespace().any(|class| class == "dragging"))
-    {
-        return None;
-    }
-    element
-        .get_attribute("data-pile")
-        .and_then(|slug| Pile::from_slug(&slug))
-        .or_else(|| {
-            element
-                .parent_element()
-                .and_then(|parent| pile_of_element(&parent))
-        })
-}
-
-/// The pile and position a click or press landed on.
-fn target_of(event: &Event) -> Option<(Pile, usize)> {
-    let mut element = event.target()?.dyn_into::<Element>().ok()?;
-    loop {
-        if let Some(slug) = element.get_attribute("data-pile") {
-            let pile = Pile::from_slug(&slug)?;
-            let index = element
-                .get_attribute("data-index")
-                .and_then(|value| value.parse::<usize>().ok())
-                .unwrap_or(0);
-            return Some((pile, index));
-        }
-        element = element.parent_element()?;
-    }
-}
-
-fn f64_to_f32(value: f64) -> f32 {
-    #[allow(clippy::cast_possible_truncation)]
-    let rounded = value.round();
-    rounded.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32
-}
-
-// -- binding -------------------------------------------------------------
-
-fn bind(window: &Window, document: &Document, shared: &Shared) {
-    bind_board(document, shared);
-    bind_tools(window, document, shared);
-    bind_menu(window, document, shared);
-    bind_keys(window, document, shared);
-}
-
-fn bind_board(document: &Document, shared: &Shared) {
-    let Some(board) = document.get_element_by_id("board") else {
-        warn("the shell has no #board", &JsValue::from_str("missing"));
-        return;
-    };
-
-    let down = {
-        let app = Rc::clone(shared);
-        Closure::<dyn FnMut(PointerEvent)>::new(move |event: PointerEvent| {
-            if event.button() != 0 {
-                return;
-            }
-            let Some(target) = event
-                .target()
-                .and_then(|target| target.dyn_into::<Element>().ok())
-            else {
-                return;
-            };
-            let Some((pile, index)) = target_of(&event) else {
-                return;
-            };
-            event.prevent_default();
-            // Capture, so a finger that leaves the board mid-drag keeps
-            // sending its moves here. A browser that refuses (a synthetic
-            // event with no real pointer behind it) is not a problem: the
-            // listener is on the board and the card never leaves it.
-            let _ = target.set_pointer_capture(event.pointer_id());
-            let mut app = app.borrow_mut();
-            app.pointer_down(
-                event.pointer_id(),
-                pile,
-                index,
-                f64::from(event.client_x()),
-                f64::from(event.client_y()),
-                Some(target),
-            );
-        })
-    };
-    listen(&board, "pointerdown", down.as_ref().unchecked_ref());
-    down.forget();
-
-    let moved = {
-        let app = Rc::clone(shared);
-        Closure::<dyn FnMut(PointerEvent)>::new(move |event: PointerEvent| {
-            app.borrow_mut().pointer_moved(
-                event.pointer_id(),
-                f64::from(event.client_x()),
-                f64::from(event.client_y()),
-            );
-        })
-    };
-    // `pointermove` is listened for on the board, which is also where capture
-    // sends it: the pointer began on a card inside the board, and the card is
-    // never reparented.
-    listen(&board, "pointermove", moved.as_ref().unchecked_ref());
-    moved.forget();
-
-    let up = {
-        let app = Rc::clone(shared);
-        Closure::<dyn FnMut(PointerEvent)>::new(move |event: PointerEvent| {
-            app.borrow_mut().pointer_up(
-                event.pointer_id(),
-                f64::from(event.client_x()),
-                f64::from(event.client_y()),
-            );
-        })
-    };
-    listen(&board, "pointerup", up.as_ref().unchecked_ref());
-    up.forget();
-
-    let cancel = {
-        let app = Rc::clone(shared);
-        Closure::<dyn FnMut(PointerEvent)>::new(move |event: PointerEvent| {
-            app.borrow_mut().pointer_cancelled(event.pointer_id());
-        })
-    };
-    listen(&board, "pointercancel", cancel.as_ref().unchecked_ref());
-    cancel.forget();
-
-    // A keyboard activation arrives as a click with no pointer detail. Mouse
-    // and touch clicks are ignored here: their gesture was already handled by
-    // the pointer listeners, and handling both would move every card twice.
-    let click = {
-        let app = Rc::clone(shared);
-        Closure::<dyn FnMut(MouseEvent)>::new(move |event: MouseEvent| {
-            if event.detail() != 0 {
-                return;
-            }
-            let Some((pile, index)) = target_of(&event) else {
-                return;
-            };
-            event.prevent_default();
-            app.borrow_mut().tap_at(pile, index);
-        })
-    };
-    listen(&board, "click", click.as_ref().unchecked_ref());
-    click.forget();
-}
-
-fn bind_tools(window: &Window, document: &Document, shared: &Shared) {
-    let window = window.clone();
-    if let Some(undo) = button(document, "undo") {
-        let app = Rc::clone(shared);
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().undo_action();
-        });
-        listen(&undo, "click", closure.as_ref().unchecked_ref());
-        closure.forget();
-    }
-    if let Some(hint) = button(document, "hint") {
-        let app = Rc::clone(shared);
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            show_hint(&app, &window);
-        });
-        listen(&hint, "click", closure.as_ref().unchecked_ref());
-        closure.forget();
-    }
-    if let Some(auto) = button(document, "auto") {
-        let app = Rc::clone(shared);
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            App::start_auto(&app);
-        });
-        listen(&auto, "click", closure.as_ref().unchecked_ref());
-        closure.forget();
-    }
-    if let Some(new) = button(document, "won-new") {
-        let app = Rc::clone(shared);
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().new_game(false);
-        });
-        listen(&new, "click", closure.as_ref().unchecked_ref());
-        closure.forget();
-    }
-}
-
-fn bind_menu(_window: &Window, document: &Document, shared: &Shared) {
-    if let Some(toggle) = checkbox(document, "menu") {
-        let app = Rc::clone(shared);
-        let boxed = toggle.clone();
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            let document = app.borrow().document.clone();
-            set_hidden(&document, "menu-panel", !boxed.checked());
-        });
-        listen(&toggle, "change", closure.as_ref().unchecked_ref());
-        closure.forget();
+    fn store_options(&self) -> String {
+        self.options.to_stored()
     }
 
-    if let Some(select) = select(document, "difficulty") {
-        let app = Rc::clone(shared);
-        let handle = select.clone();
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            let value = handle.value();
-            let mut app = app.borrow_mut();
-            app.options.difficulty = Difficulty::from_slug(&value).unwrap_or(Difficulty::Medium);
-            app.save_options();
-            app.paint_menu();
-            app.say("Difficulty set. It applies to the next deal.");
-        });
-        listen(&select, "change", closure.as_ref().unchecked_ref());
-        closure.forget();
+    fn load_options(&mut self, text: &str) {
+        self.options = Options::from_stored(Some(text));
     }
 
-    if let Some(select) = select(document, "scoring") {
-        let app = Rc::clone(shared);
-        let handle = select.clone();
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            let value = handle.value();
-            let mut app = app.borrow_mut();
-            app.options.scoring = Scoring::from_slug(&value).unwrap_or(Scoring::Standard);
-            app.save_options();
-            app.paint_menu();
-            app.say("Scoring set. It applies to the next deal.");
-        });
-        listen(&select, "change", closure.as_ref().unchecked_ref());
-        closure.forget();
+    fn store_game(&self) -> Option<String> {
+        self.game.to_stored()
     }
 
-    if let Some(new) = button(document, "new") {
-        let app = Rc::clone(shared);
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().new_game(false);
-        });
-        listen(&new, "click", closure.as_ref().unchecked_ref());
-        closure.forget();
-    }
-
-    if let Some(restart) = button(document, "restart") {
-        let app = Rc::clone(shared);
-        let closure = Closure::<dyn FnMut()>::new(move || {
-            app.borrow_mut().new_game(true);
-        });
-        listen(&restart, "click", closure.as_ref().unchecked_ref());
-        closure.forget();
-    }
-}
-
-fn bind_keys(window: &Window, document: &Document, shared: &Shared) {
-    let window = window.clone();
-    let shared = Rc::clone(shared);
-    let closure = {
-        let app = Rc::clone(&shared);
-        Closure::<dyn FnMut(KeyboardEvent)>::new(move |event: KeyboardEvent| {
-            if is_form_control(event.target()) {
-                return;
-            }
-            let mut app = app.borrow_mut();
-            if app.menu_open() {
-                if event.key() == "Escape" {
-                    close_menu(&app.document);
-                    event.prevent_default();
-                }
-                return;
-            }
-            let key = event.key();
-            let handled = match key.as_str() {
-                "ArrowLeft" => {
-                    app.move_focus(-1);
-                    true
-                }
-                "ArrowRight" => {
-                    app.move_focus(1);
-                    true
-                }
-                "ArrowUp" => {
-                    app.move_within(-1);
-                    true
-                }
-                "ArrowDown" => {
-                    app.move_within(1);
-                    true
-                }
-                "Escape" => {
-                    let report = app.game.clear_selection();
-                    app.paint();
-                    if !report.words.is_empty() {
-                        app.say(&report.words);
-                    }
-                    true
-                }
-                "u" | "U" => {
-                    app.undo_action();
-                    true
-                }
-                "d" | "D" => {
-                    app.draw_action();
-                    true
-                }
-                "h" | "H" => {
-                    drop(app);
-                    show_hint(&shared, &window);
-                    true
-                }
-                "z" | "Z" if event.ctrl_key() || event.meta_key() => {
-                    app.undo_action();
-                    true
-                }
-                _ => false,
-            };
-            if handled {
-                event.prevent_default();
-            }
-        })
-    };
-    listen(document, "keydown", closure.as_ref().unchecked_ref());
-    closure.forget();
-}
-
-fn is_form_control(target: Option<web_sys::EventTarget>) -> bool {
-    let Some(target) = target.and_then(|target| target.dyn_into::<Element>().ok()) else {
-        return false;
-    };
-    matches!(
-        target.tag_name().as_str(),
-        "INPUT" | "SELECT" | "TEXTAREA" | "OPTION"
-    )
-}
-
-fn show_hint(shared: &Shared, window: &Window) {
-    let mut app = shared.borrow_mut();
-    if app.game.won() {
-        return;
-    }
-    let hint = app.game.hint();
-    if let Hint::None { .. } = &hint {
-        app.say(hint.words());
-        return;
-    }
-    app.say(hint.words());
-    app.hint = Some(hint);
-    app.hint_token = app.hint_token.wrapping_add(1);
-    let token = app.hint_token;
-    app.paint();
-    drop(app);
-
-    let reused = Rc::clone(shared);
-    let closure = Closure::<dyn FnMut()>::new(move || {
-        let mut app = reused.borrow_mut();
-        if app.hint_token == token {
-            app.hint = None;
-            app.paint();
-        }
-    });
-    let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-        closure.as_ref().unchecked_ref(),
-        HINT_MS,
-    );
-    closure.forget();
-}
-
-impl App {
-    fn menu_open(&self) -> bool {
-        checkbox(&self.document, "menu").is_some_and(|toggle| toggle.checked())
-    }
-}
-
-fn close_menu(document: &Document) {
-    if let Some(toggle) = checkbox(document, "menu") {
-        toggle.set_checked(false);
-    }
-    set_hidden(document, "menu-panel", true);
-}
-
-// -- small DOM helpers ---------------------------------------------------
-
-fn element(document: &Document, id: &str) -> Option<Element> {
-    document.get_element_by_id(id)
-}
-
-fn button(document: &Document, id: &str) -> Option<HtmlButtonElement> {
-    element(document, id)?.dyn_into().ok()
-}
-
-fn checkbox(document: &Document, id: &str) -> Option<HtmlInputElement> {
-    element(document, id)?.dyn_into().ok()
-}
-
-fn select(document: &Document, id: &str) -> Option<HtmlSelectElement> {
-    element(document, id)?.dyn_into().ok()
-}
-
-fn set_text(document: &Document, id: &str, text: &str) {
-    if let Some(element) = element(document, id) {
-        element.set_text_content(Some(text));
-    }
-}
-
-fn set_hidden(document: &Document, id: &str, hidden: bool) {
-    if let Some(element) =
-        element(document, id).and_then(|element| element.dyn_into::<HtmlElement>().ok())
-    {
-        element.set_hidden(hidden);
-    }
-}
-
-fn set_select(document: &Document, id: &str, value: &str) {
-    if let Some(select) = select(document, id) {
-        if select.value() != value {
-            select.set_value(value);
-        }
-    }
-}
-
-fn listen(target: &web_sys::EventTarget, event: &str, callback: &js_sys::Function) {
-    if let Err(error) = target.add_event_listener_with_callback(event, callback) {
-        warn("could not bind an event", &error);
-    }
-}
-
-fn storage(window: &Window) -> Option<Storage> {
-    window.local_storage().ok().flatten()
-}
-
-fn read(window: &Window, key: &str) -> Option<String> {
-    storage(window)?.get_item(key).ok().flatten()
-}
-
-fn fresh_seed() -> u64 {
-    let now = js_sys::Date::now();
-    let random = js_sys::Math::random();
-    now.to_bits() ^ random.to_bits().rotate_left(17)
-}
-
-fn warn(context: &str, error: &JsValue) {
-    web_sys::console::warn_2(&JsValue::from_str(context), error);
-}
-
-fn observe_resize(window: &Window, shared: &Shared) {
-    let Some(wrap) = window
-        .document()
-        .and_then(|document| document.get_element_by_id("board"))
-        .and_then(|board| board.parent_element())
-    else {
-        return;
-    };
-    let app = Rc::clone(shared);
-    let callback = Closure::<dyn FnMut()>::new(move || {
-        app.borrow_mut().paint();
-    });
-    match web_sys::ResizeObserver::new(callback.as_ref().unchecked_ref()) {
-        Ok(observer) => {
-            observer.observe(&wrap);
-            // The observer lives exactly as long as the page, and the page is
-            // the app: dropping it here would stop every future resize.
-            std::mem::forget(observer);
-        }
-        Err(error) => warn("could not watch the board size", &error),
-    }
-    callback.forget();
-}
-
-/// Let the cards move from now on.
-///
-/// The board is built with `.instant`, which turns every transition off, so the
-/// first paint puts the whole deal on the table instead of animating 52 cards
-/// out of the top-left corner. One frame later the class comes off and moves
-/// travel.
-fn release_instant_layout(window: &Window, shared: &Shared) {
-    let app = Rc::clone(shared);
-    let closure = Closure::<dyn FnMut()>::new(move || {
-        if let Some(board) = app.borrow().document.get_element_by_id("board") {
-            board.set_class_name("");
-        }
-    });
-    let _ = window.request_animation_frame(closure.as_ref().unchecked_ref());
-    closure.forget();
-}
-
-fn start_clock(window: &Window, shared: &Shared) {
-    let last = Rc::new(Cell::new(js_sys::Date::now()));
-    let app = Rc::clone(shared);
-    let closure = Closure::<dyn FnMut()>::new(move || {
-        let now = js_sys::Date::now();
-        let delta = ((now - last.get()) / 1_000.0).max(0.0);
-        last.set(now);
-        let mut app = app.borrow_mut();
-        let pending = app.pending.get() + delta;
-        let whole = pending.floor();
-        app.pending.set(pending - whole);
-        if whole >= 1.0 {
-            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-            let seconds = whole.min(f64::from(u32::MAX)) as u32;
-            app.tick(seconds);
-        }
-    });
-    match window.set_interval_with_callback_and_timeout_and_arguments_0(
-        closure.as_ref().unchecked_ref(),
-        TICK_MS,
-    ) {
-        Ok(_) => closure.forget(),
-        Err(error) => warn("could not start the clock", &error),
-    }
-}
-
-// -- offline -------------------------------------------------------------
-
-/// Register the service worker, and release any stale registration.
-///
-/// Deliberately silent: the worker is a background concern, and an app that
-/// stays usable without it is the point. Registration is awaited, but never
-/// before the app is interactive: offline support is not worth a blank screen.
-async fn keep_offline(window: Window) {
-    let container = window.navigator().service_worker();
-    let options = web_sys::RegistrationOptions::new();
-    options.set_scope(SCOPE);
-    let registered =
-        JsFuture::from(container.register_with_options("./service-worker.js", &options)).await;
-    let registered = match registered {
-        Ok(value) => value,
-        Err(error) => {
-            warn("service worker registration failed", &error);
-            return;
-        }
-    };
-    if let Ok(registered) = registered.dyn_into::<web_sys::ServiceWorkerRegistration>() {
-        nudge_worker_update(&registered).await;
-    }
-    release_stale_registrations(&window).await;
-}
-
-/// Ask this app's worker to take over as soon as it can, because the page that
-/// asks reloads as the handover happens. The worker never swaps itself in
-/// unasked.
-async fn nudge_worker_update(registration: &web_sys::ServiceWorkerRegistration) {
-    let Some(window) = web_sys::window() else {
-        return;
-    };
-    watch_for_controller_change(&window);
-
-    if let Some(worker) = registration.waiting() {
-        if worker.state() == web_sys::ServiceWorkerState::Installed {
-            ask_worker_in(&worker);
-            return;
+    fn load_game(&mut self, text: &str) {
+        if let Some(game) = Game::from_stored(Some(text)) {
+            self.game = game;
+        } else {
+            // An unreadable save is a fresh deal, not an error: a corrupt entry
+            // must never stop the app from starting.
+            self.game = Game::new(self.options.difficulty, self.options.scoring, fresh_seed());
         }
     }
 
-    let installing = match registration.installing() {
-        Some(worker) => Some(worker),
-        None => update_found(registration).await,
-    };
-    let Some(worker) = installing else {
-        return;
-    };
-    if wait_for_state_change(&worker).await.is_err() {
-        warn("could not wait for the worker to install", &JsValue::NULL);
-        return;
+    fn keys(&self) -> (&'static str, &'static str) {
+        (STORAGE_KEY, OPTIONS_KEY)
     }
-    if worker.state() == web_sys::ServiceWorkerState::Installed {
-        ask_worker_in(&worker);
+
+    fn new_game(&mut self) {
+        self.game = Game::dealt(self.options.difficulty, self.options.scoring, fresh_seed());
+    }
+
+    fn restart(&mut self) {
+        self.game = self.game.restart();
     }
 }
 
-fn ask_worker_in(worker: &web_sys::ServiceWorker) {
-    worker.post_message(&JsValue::from_str("SKIP_WAITING")).ok();
-}
-
-fn watch_for_controller_change(window: &web_sys::Window) {
-    thread_local! {
-        static WATCHING: Cell<bool> = const { Cell::new(false) };
-    }
-    if WATCHING.with(Cell::get) {
-        return;
-    }
-    WATCHING.with(|watching| watching.set(true));
-
-    let container = window.navigator().service_worker();
-    // Whether this page was already being served by a worker. It matters
-    // exactly once, on the first visit ever: the worker claims the page as it
-    // activates, which fires `controllerchange` — but nothing stale was
-    // replaced, so there is nothing to reload for, and reloading would only
-    // cost the reader a second start. A page that *was* controlled is being
-    // handed from one version to another, and that page must reload.
-    let replacing = container.controller().is_some();
-    let handler = Closure::<dyn FnMut(JsValue)>::new(move |_event: JsValue| {
-        if !replacing {
-            return;
+impl Klondike {
+    /// Say what the game says, then let the shell know the board moved.
+    /// Keep whatever the game said, for the shell to put under the board.
+    fn show(&mut self, report: Report) {
+        if !report.words.is_empty() {
+            self.words = Some(report.words);
         }
-        if let Some(window) = web_sys::window() {
-            window.location().reload().ok();
-        }
-    });
-    let _ = container
-        .add_event_listener_with_callback("controllerchange", handler.as_ref().unchecked_ref());
-    handler.forget();
-}
-
-async fn update_found(
-    registration: &web_sys::ServiceWorkerRegistration,
-) -> Option<web_sys::ServiceWorker> {
-    let event = JsFuture::from(js_sys::Promise::new(&mut |resolve, _reject| {
-        let resolved = Closure::<dyn FnMut(JsValue)>::new(move |value: JsValue| {
-            resolve.call1(&JsValue::NULL, &value).ok();
-        });
-        let _ = registration
-            .add_event_listener_with_callback("updatefound", resolved.as_ref().unchecked_ref());
-        resolved.forget();
-    }))
-    .await
-    .ok()?;
-    let event = event.dyn_into::<web_sys::Event>().ok()?;
-    let announced = event
-        .target()?
-        .dyn_into::<web_sys::ServiceWorkerRegistration>()
-        .ok()?;
-    announced.installing()
-}
-
-async fn wait_for_state_change(worker: &web_sys::ServiceWorker) -> Result<(), JsValue> {
-    JsFuture::from(js_sys::Promise::new(&mut |resolve, _reject| {
-        let resolved = Closure::<dyn FnMut(JsValue)>::new(move |value: JsValue| {
-            resolve.call1(&JsValue::NULL, &value).ok();
-        });
-        let _ = worker
-            .add_event_listener_with_callback("statechange", resolved.as_ref().unchecked_ref());
-        resolved.forget();
-    }))
-    .await
-    .map(|_| ())
-}
-
-async fn release_stale_registrations(window: &Window) {
-    let container = window.navigator().service_worker();
-    let Ok(registrations) = JsFuture::from(container.get_registrations()).await else {
-        return;
-    };
-    let Ok(array) = registrations.dyn_into::<js_sys::Array>() else {
-        return;
-    };
-
-    let Ok(home) = window.location().href() else {
-        return;
-    };
-    let Ok(ours) = web_sys::Url::new_with_base(&home, "./") else {
-        return;
-    };
-    let ours = ours.href();
-
-    for entry in array.iter() {
-        let Ok(registration) = entry.dyn_into::<web_sys::ServiceWorkerRegistration>() else {
-            continue;
-        };
-        let scope = registration.scope();
-        if ours.starts_with(&scope) {
-            continue;
-        }
-        let script = registration
-            .active()
-            .map(|worker| worker.script_url())
-            .unwrap_or_default();
-        if script_belongs_to_app(&script, &ours) {
-            match registration.unregister() {
-                Ok(promise) => {
-                    let _ = JsFuture::from(promise).await;
-                }
-                Err(error) => warn("stale service worker could not be released", &error),
-            }
-        }
-    }
-}
-
-fn script_belongs_to_app(script: &str, ours: &str) -> bool {
-    match web_sys::Url::new(script) {
-        Ok(url) => url.href().strip_suffix("service-worker.js") == Some(ours),
-        Err(_) => false,
     }
 }
 
@@ -1808,36 +373,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_card_is_marked_up_from_its_own_rank_and_suit() {
-        let html = card_html(crate::card::Card::new(
-            crate::card::Rank::Queen,
-            crate::card::Suit::Hearts,
-        ));
-        assert!(html.contains("Q"));
-        assert!(html.contains("♥"));
-        assert!(html.contains("class=\"face\""));
-        assert!(html.contains("class=\"back\""));
-    }
-
-    #[test]
-    fn the_pile_names_round_trip_through_the_dom_tokens() {
+    fn every_pile_has_a_place_and_every_place_has_a_pile() {
         for pile in Pile::ALL {
-            assert_eq!(Pile::from_slug(&pile.slug()), Some(pile));
+            assert_eq!(Klondike::pile(pile.place()), Some(pile));
         }
-        assert_eq!(Pile::from_slug("foundation-4"), None);
-        assert_eq!(Pile::from_slug("tableau-7"), None);
     }
 
     #[test]
-    fn stacked_cards_sort_above_the_cards_below_them() {
-        assert!(z_index(Pile::Tableau(0), 3) > z_index(Pile::Tableau(0), 2));
-        assert!(z_index(Pile::Tableau(6), 0) > z_index(Pile::Tableau(0), 50));
+    fn the_waste_fans_by_the_difficulty_and_a_packet_does_not() {
+        let easy = Game::new(Difficulty::Easy, Scoring::Standard, 1);
+        let hard = Game::new(Difficulty::Hard, Scoring::Standard, 1);
+        assert_eq!(fan_for(&easy, Pile::Waste).fan_tail, 1);
+        assert_eq!(fan_for(&hard, Pile::Waste).fan_tail, 3);
+        assert!(fan_for(&easy, Pile::Stock).stacked);
+        assert!(fan_for(&easy, Pile::Foundation(0)).stacked);
+        assert!(!fan_for(&easy, Pile::Tableau(0)).stacked);
     }
 
     #[test]
-    fn a_coordinate_is_clamped_rather_than_wrapped() {
-        assert_eq!(f64_to_f32(3.6), 4.0);
-        assert_eq!(f64_to_f32(-1.2), -1.0);
-        assert_eq!(f64_to_f32(1e12), f32::MAX);
+    fn the_keyboard_starts_on_the_stock_while_there_is_one() {
+        let game = Game::new(Difficulty::Medium, Scoring::Standard, 3);
+        let focus = default_focus(&game);
+        assert_eq!(focus.0, Pile::Stock.place());
     }
 }

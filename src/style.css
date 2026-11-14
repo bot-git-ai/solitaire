@@ -216,10 +216,13 @@ h1 {
   outline-offset: 2px;
 }
 
-.slot.hinted {
-  border-color: var(--hint);
-  color: var(--hint);
-  box-shadow: 0 0 0 2px var(--hint);
+/* The pile a drag would land on. Drawn on the slot for an empty pile and on the
+   top card for a full one, so the ring is always around the card the player is
+   aiming at rather than hidden under the pile. */
+.slot.drop {
+  border-color: var(--accent);
+  border-style: solid;
+  box-shadow: 0 0 0 2px var(--accent);
 }
 
 /* The card. The width and height are set on #board, one pair for the whole
@@ -336,6 +339,15 @@ h1 {
     0 calc(var(--cw) * .02) calc(var(--cw) * .09) rgb(0 0 0 / 35%);
 }
 
+/* Where the held run will land, if the player lets go now. A ring rather than a
+   glow: it has to read at a glance while the finger is moving, and against a
+   white card a filled tint would wash out the rank the player is checking. */
+.card.drop-target {
+  box-shadow:
+    0 0 0 calc(var(--cw) * .045) var(--accent),
+    0 calc(var(--cw) * .02) calc(var(--cw) * .09) rgb(0 0 0 / 35%);
+}
+
 .card.hinted {
   box-shadow:
     0 0 0 calc(var(--cw) * .035) var(--hint),
@@ -347,15 +359,24 @@ h1 {
   z-index: 800 !important;
 }
 
+/* In the air. No transition at all: every move must land exactly where the
+   pointer is, not where a tween thinks it should be, or the card lags behind the
+   finger by a frame and the whole gesture feels broken. The lift is what makes
+   it read as picked up rather than slid. */
 .card.dragging {
-  /* No transition while a card is under the finger: every move must land where
-     the pointer is, not where a tween thinks it should be. */
   transition: none;
   cursor: grabbing;
+  filter: brightness(1.04);
   box-shadow:
-    0 0 0 1px rgb(0 0 0 / 20%),
-    0 calc(var(--cw) * .12) calc(var(--cw) * .3) rgb(0 0 0 / 45%);
+    0 0 0 1px rgb(0 0 0 / 18%),
+    0 calc(var(--cw) * .1) calc(var(--cw) * .26) rgb(0 0 0 / 38%),
+    0 calc(var(--cw) * .25) calc(var(--cw) * .6) rgb(0 0 0 / 22%);
 }
+
+/* A card that has left the board — one of the thirteen in a completed run. The
+   element stays, because the deck is built once and never rebuilt, but it is
+   not drawn. */
+.card.gone { display: none !important; }
 
 .card:focus-visible {
   outline: 3px solid var(--focus);
@@ -401,6 +422,13 @@ h1 {
 .tools button:active, .menu-button:active, .won-card button:active {
   filter: brightness(.92);
 }
+
+.tools button[hidden] { display: none; }
+
+/* Three buttons and a menu when the game has no extra action; four otherwise.
+   The grid follows what is visible, so a game without one does not leave a
+   hole. */
+.tools { grid-auto-flow: column; grid-auto-columns: 1fr; }
 
 .tools button:disabled {
   opacity: .42;

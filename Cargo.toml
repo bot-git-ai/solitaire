@@ -32,8 +32,10 @@ js-sys = "0.3"
 # pulls generated bindings you do not need into the wasm.
 web-sys = { version = "0.3", features = [
   "Window", "Document", "Element", "HtmlElement", "HtmlButtonElement",
+  "DomRect", "CssStyleDeclaration", "HtmlCollection", "NodeList", "Node",
   "HtmlSelectElement", "HtmlInputElement", "Node", "Event", "EventTarget",
   "KeyboardEvent", "PointerEvent", "MouseEvent", "AddEventListenerOptions",
+  "ResizeObserver", "ResizeObserverEntry", "Storage", "StorageManager",
   "ResizeObserver", "ResizeObserverEntry", "Navigator", "Storage",
   "ServiceWorkerContainer", "ServiceWorkerRegistration", "ServiceWorker",
   "ServiceWorkerState", "RegistrationOptions", "console", "Location", "Url"
