@@ -19,14 +19,13 @@
 //!   noise in the one place the cards want to be. A tap that *fails* is the
 //!   exception, because the board then shows nothing and silence would read as
 //!   a broken control.
-//! * **Every word is written here.** [`check_words`], [`Game::readout`],
+//! * **Every word is written here.** [`stuck_words`], [`Game::readout`],
 //!   [`Game::result_words`] and the refusals above are the only places that
 //!   turn state into prose; the page never composes a sentence of its own.
 
 use std::fmt::Write as _;
 
 use crate::card::{deck, Card, Rank};
-use crate::solver::Verdict;
 
 /// Key the game is saved under.
 ///
@@ -430,6 +429,22 @@ fn refuse(why: impl Into<String>) -> Words {
     Some(why.into())
 }
 
+/// What the Stuck? button found.
+///
+/// It is an answer about the board in front of the player and nothing more: a
+/// question about whether the deal can still be *won* is a different one, it
+/// needs a search of everything the deal could become, and it is not what a
+/// player pressing this button is asking.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stuck {
+    /// Some move changes the deal: a card can go home, a run can turn one over
+    /// or empty a column, the waste can be played, or the stock has cards to
+    /// turn.
+    Playing,
+    /// Every move still legal puts back what another one took out.
+    Dead,
+}
+
 /// A suggested move, or a suggestion about the stock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Hint {
@@ -730,24 +745,6 @@ impl Game {
         !self.history.is_empty()
     }
 
-    /// How many redeals this deal still allows, or `None` for no limit.
-    #[must_use]
-    pub fn redeals_left(&self) -> Option<u32> {
-        self.redeal_limit()
-            .map(|max| max.saturating_sub(self.redeals))
-    }
-
-    /// How many times the waste has been turned back over.
-    ///
-    /// The count is only part of a position when the deal limits it: with
-    /// unlimited passes, a board that has been turned over twice and the same
-    /// board turned over three times are the same place to play from, and a
-    /// search that told them apart would never finish.
-    #[must_use]
-    pub const fn redeals_used(&self) -> u32 {
-        self.redeals
-    }
-
     /// The rules in one line, for the menu.
     #[must_use]
     pub fn summary(&self) -> String {
@@ -785,6 +782,33 @@ impl Game {
                 Scoring::Vegas => Some(money(self.score)),
                 Scoring::Off => None,
             },
+        }
+    }
+
+    /// Is the player out of moves that do anything?
+    ///
+    /// "Stuck" is a question about the board in front of the player: whether
+    /// *any* legal move changes it, rather than a shuffle whose reverse is the
+    /// next move. A card that goes home, a run that turns a face-down card over
+    /// or empties a column, a waste card that can be played, and the stock all
+    /// change the deal; a queen moved off a king and back onto it does not.
+    ///
+    /// The answer is [`Game::hint`]'s, read the other way round, and that is
+    /// the point of writing it this way: the hint already decides what is worth
+    /// pointing at, and asking it is what stops a "not stuck" from arriving
+    /// with nothing to suggest. So the two can never disagree, and "not stuck"
+    /// means precisely that Hint has something to point at.
+    ///
+    /// The shell asks this only about a deal still in play — the button is
+    /// disabled and the shortcut returns once the deal has been won — and a won
+    /// board is not a stuck one, so it answers `Playing` rather than filing a
+    /// victory under a dead deal.
+    #[must_use]
+    pub fn stuck(&self) -> Stuck {
+        if self.won || !matches!(self.hint(), Hint::None { .. }) {
+            Stuck::Playing
+        } else {
+            Stuck::Dead
         }
     }
 
@@ -1629,20 +1653,20 @@ fn valid_foundation(cards: &[u16], deck: &[Card]) -> bool {
     })
 }
 
-/// What the status line says when the deal has been checked for a way out.
+/// What the status line says when the deal has been looked over for a move.
 ///
-/// Three answers, and they are not one answer with two excuses: "no way to win
-/// from here" is a claim the search has *proved*, while "not sure" is the
-/// search saying it did not get far enough. Telling a player the first when it
-/// means the second would cost them a game they could still have won, so the
-/// two never share a sentence.
+/// Two answers, and they are both claims about the board rather than about
+/// what it might become: "there is a move worth making" (and the hint will
+/// point at one) or "there is nothing left but undoing".
 #[must_use]
-pub fn check_words(verdict: Verdict) -> String {
-    match verdict {
-        Verdict::Winnable => "Not stuck: there is a way to win from here.".to_owned(),
-        Verdict::Dead => "Stuck: no way to win from here. Undo, or start a new game.".to_owned(),
-        Verdict::Unclear => {
-            "Not sure: too many moves to try them all. The deal may still be winnable.".to_owned()
+pub fn stuck_words(stuck: Stuck) -> String {
+    match stuck {
+        Stuck::Playing => {
+            "Not stuck: there is still a move worth making. Hint points at one.".to_owned()
+        }
+        Stuck::Dead => {
+            "Stuck: every move left only puts back what another took out. Undo, or start a new game."
+                .to_owned()
         }
     }
 }
@@ -1878,12 +1902,16 @@ mod tests {
         game.draw();
         assert!(game.stock.is_empty());
         game.draw();
-        assert_eq!(game.redeals_left(), Some(1));
+        assert_eq!(game.redeals, 1);
         game.draw();
-        game.draw();
-        assert_eq!(game.redeals_left(), Some(0));
-        game.draw();
-        assert!(game.stock.is_empty());
+        assert!(game.can_redeal(), "one pass left, and cards in the waste");
+        // Three passes through the stock is the whole of the deal's allowance:
+        // the first, and two more.
+        for _ in 0..2 {
+            game.draw();
+        }
+        assert_eq!(game.redeals, 2);
+        assert!(!game.can_redeal());
         assert_eq!(game.draw().as_deref(), Some("No passes left."));
         assert!(game.stock.is_empty());
     }
@@ -2056,18 +2084,52 @@ mod tests {
     }
 
     #[test]
-    fn a_check_says_which_of_the_three_answers_it_has() {
-        let winnable = check_words(Verdict::Winnable);
-        let stuck = check_words(Verdict::Dead);
-        let unsure = check_words(Verdict::Unclear);
-        assert!(winnable.starts_with("Not stuck"));
-        assert!(stuck.starts_with("Stuck"));
-        assert!(unsure.starts_with("Not sure"));
-        // The three must not be able to be mistaken for one another: a proved
-        // dead end and a search that gave up are different answers.
-        for (one, other) in [(&winnable, &stuck), (&winnable, &unsure), (&stuck, &unsure)] {
-            assert_ne!(one, other);
-        }
+    fn a_check_says_which_of_the_two_answers_it_has() {
+        let playing = stuck_words(Stuck::Playing);
+        let dead = stuck_words(Stuck::Dead);
+        assert!(playing.starts_with("Not stuck"));
+        assert!(dead.starts_with("Stuck"));
+        assert_ne!(playing, dead);
+        // "Not stuck" has to say where to look next, because the player's own
+        // eyes have already failed to find the move.
+        assert!(playing.contains("Hint"));
+    }
+
+    /// The check answers a question about the board, not about a deal it could
+    /// become: a move that changes something is enough, and a deal whose only
+    /// legal move puts back what another took out is stuck.
+    #[test]
+    fn stuck_means_no_move_left_but_a_shuffle() {
+        // A fresh deal has the stock to turn, which always changes something.
+        let fresh = Game::dealt(Difficulty::Easy, Scoring::Standard, 11);
+        assert_eq!(fresh.stuck(), Stuck::Playing);
+
+        // Two black cards on their own, with nothing to turn and nothing that
+        // will take either of them: the only moves left are kings shuffling
+        // between empty columns, and those are the same board renamed.
+        let mut dead = empty_game(Scoring::Standard);
+        put_column(&mut dead, 0, &[(Rank::King, Suit::Spades)], 0);
+        put_column(&mut dead, 1, &[(Rank::Queen, Suit::Spades)], 0);
+        assert_eq!(dead.stuck(), Stuck::Dead);
+        assert!(matches!(dead.hint(), Hint::None { .. }));
+
+        // The same board with one card that can go home is not stuck.
+        let mut playing = empty_game(Scoring::Standard);
+        put_column(&mut playing, 0, &[(Rank::King, Suit::Spades)], 0);
+        put_column(&mut playing, 1, &[(Rank::Ace, Suit::Hearts)], 0);
+        assert_eq!(playing.stuck(), Stuck::Playing);
+
+        // Nor is one where the only move is a run onto another column that
+        // turns a card over: that is a change, even with the stock empty.
+        let mut revealing = empty_game(Scoring::Standard);
+        put_column(
+            &mut revealing,
+            0,
+            &[(Rank::Nine, Suit::Spades), (Rank::Four, Suit::Hearts)],
+            1,
+        );
+        put_column(&mut revealing, 1, &[(Rank::Five, Suit::Clubs)], 0);
+        assert_eq!(revealing.stuck(), Stuck::Playing);
     }
 
     #[test]

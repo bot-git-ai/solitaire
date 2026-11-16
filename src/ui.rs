@@ -15,30 +15,12 @@ use crate::board::{Place, Scene};
 use crate::board_ui::{BoardUi, Intent};
 use crate::card::deck;
 use crate::game::{
-    check_words, Difficulty, Game, Hint, Options, Pile, Scoring, Words, OPTIONS_KEY, STORAGE_KEY,
+    stuck_words, Difficulty, Game, Hint, Options, Pile, Scoring, Words, OPTIONS_KEY, STORAGE_KEY,
 };
 use crate::shell::{fresh_seed, Inspect, Rules};
-use crate::solver::{Solver, Verdict};
 
 /// How long the automatic finish waits between cards, so it can be watched.
 const FINISH_MS: i32 = 140;
-
-/// How many positions one slice of a stuck check examines.
-///
-/// A slice is measured in positions rather than milliseconds because the search
-/// is the same work whatever the device, so the page stays inside a frame's
-/// worth of work on a phone and a desktop both. Measured on this box the walk
-/// examines about 1.7 million positions a second, so a slice is some ten
-/// milliseconds of work: the board keeps moving, and a check is done in about a
-/// second because the page takes a slice a frame.
-const CHECK_SLICE: u64 = 18_000;
-
-/// How many positions a check may examine in all before it says it is not sure.
-///
-/// A hundred slices, so the longest a player waits is under two seconds. That
-/// is the whole of the budget: it is a question about patience, not about
-/// cards, and it is spent on the deals that need it rather than on every deal.
-const CHECK_BUDGET: u64 = 1_200_000;
 
 /// Start the app.
 ///
@@ -63,8 +45,6 @@ struct Klondike {
     game: Game,
     options: Options,
     hint: Option<Hint>,
-    /// The stuck check in progress, if the player asked for one.
-    check: Option<Solver>,
     /// What the page has to say about the last action, waiting to be shown.
     ///
     /// `Some("")` is not the same as `None`: it is the instruction to clear the
@@ -79,7 +59,6 @@ impl Default for Klondike {
             game: Game::new(Options::default().difficulty, Options::default().scoring, 0),
             options: Options::default(),
             hint: None,
-            check: None,
             words: None,
         }
     }
@@ -215,9 +194,6 @@ impl Rules for Klondike {
 
     fn clear_hint(&mut self) {
         self.hint = None;
-        // A check answers a question about one position, so the moment the
-        // board moves the answer is about a deal that no longer exists.
-        self.check = None;
     }
 
     fn won(&self) -> bool {
@@ -288,29 +264,11 @@ impl Rules for Klondike {
         Some("Stuck?")
     }
 
-    fn inspect_enabled(&self) -> bool {
-        self.check.is_none()
-    }
-
+    /// The question is about the board on screen, so it is answered in one
+    /// go: there is no search to slice up, and `Inspect::Busy` — the page
+    /// coming back for another frame — is a thing this game never needs.
     fn inspect(&mut self) -> Inspect {
-        if self.check.is_none() {
-            self.check = Solver::new(&self.game, CHECK_BUDGET);
-            if self.check.is_none() {
-                // A board the search cannot read is one it cannot answer for.
-                return Inspect::Done(Some(check_words(Verdict::Unclear)));
-            }
-        }
-        let verdict = self
-            .check
-            .as_mut()
-            .and_then(|check| check.step(CHECK_SLICE));
-        match verdict {
-            None => Inspect::Busy,
-            Some(verdict) => {
-                self.check = None;
-                Inspect::Done(Some(check_words(verdict)))
-            }
-        }
+        Inspect::Done(Some(stuck_words(self.game.stuck())))
     }
 
     fn take_words(&mut self) -> Option<String> {
