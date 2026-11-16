@@ -82,9 +82,7 @@ impl Klondike {
     }
 
     fn tap(&mut self, place: Place, index: Option<usize>) -> Words {
-        let Some(pile) = Self::pile(place) else {
-            return None;
-        };
+        let pile = Self::pile(place)?;
         if pile == Pile::Stock {
             return self.game.draw();
         }
