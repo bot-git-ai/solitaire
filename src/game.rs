@@ -13,9 +13,15 @@
 //!   remembering, for each feature, what it touched.
 //! * **Every random deal is a seed.** The same seed deals the same game, which
 //!   is what makes "Restart deal" honest and a saved game a few hundred bytes.
-//! * **Every word is written here.** `Report`, [`Game::readout`] and
-//!   [`Game::result_words`] are the only places that turn state into prose; the
-//!   page never composes a sentence of its own.
+//! * **A move says nothing.** The board is the record of what happened, so a
+//!   move, a draw, a recycle or an undo returns no words at all: a line of text
+//!   under the table repeating what the player just watched themselves do is
+//!   noise in the one place the cards want to be. A tap that *fails* is the
+//!   exception, because the board then shows nothing and silence would read as
+//!   a broken control.
+//! * **Every word is written here.** [`check_words`], [`Game::readout`],
+//!   [`Game::result_words`] and the refusals above are the only places that
+//!   turn state into prose; the page never composes a sentence of its own.
 
 use std::fmt::Write as _;
 
@@ -411,26 +417,17 @@ struct Snapshot {
     won: bool,
 }
 
-/// What a tap, a draw or an undo just did, in the game's own words.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Report {
-    /// True when the player won on this action.
-    pub won: bool,
-    /// One sentence for the status line. Empty when there is nothing worth
-    /// saying (a tap on an empty place, for instance).
-    pub words: String,
-}
+/// What a tap, a draw or an undo says for itself, in the game's own words.
+///
+/// A mutation returns `None` when the board told the story already, which is
+/// almost always: the cards moved, so there is nothing to say. `Some` is for a
+/// refusal — a tap that changed nothing, where silence would read as a broken
+/// control.
+pub type Words = Option<String>;
 
-impl Report {
-    /// A report with nothing to shout about. Used by the page for the cases
-    /// where a press means nothing at all.
-    #[must_use]
-    pub fn quiet(words: impl Into<String>) -> Self {
-        Self {
-            won: false,
-            words: words.into(),
-        }
-    }
+/// A refusal: the tap could not do what it was aimed at, so it says why.
+fn refuse(why: impl Into<String>) -> Words {
+    Some(why.into())
 }
 
 /// A suggested move, or a suggestion about the stock.
@@ -652,12 +649,12 @@ impl Game {
     }
 
     /// Put the held run back without moving it.
-    pub fn clear_selection(&mut self) -> Report {
-        if self.selection.take().is_some() {
-            Report::quiet("Put back.")
-        } else {
-            Report::quiet("")
-        }
+    ///
+    /// Nothing is said: the run drops back to where it came from, which is the
+    /// whole of the answer.
+    pub fn clear_selection(&mut self) -> Words {
+        self.selection = None;
+        None
     }
 
     /// Whether a card in a pile is printed face down.
@@ -825,9 +822,13 @@ impl Game {
     ///
     /// The whole click grammar lives here: pick up, put down, put the picked-up
     /// run down, or switch the pick to another movable card.
-    pub fn tap(&mut self, pile: Pile, index: usize) -> Report {
+    ///
+    /// A tap that moves a card says nothing — the card is the sentence. A tap
+    /// that cannot do what it was aimed at says why, because nothing moved and
+    /// a control that answers nothing is a control the player thinks is broken.
+    pub fn tap(&mut self, pile: Pile, index: usize) -> Words {
         if self.won {
-            return Report::quiet("The deal is over. Start a new one.");
+            return None;
         }
         if pile == Pile::Stock {
             return self.draw();
@@ -835,13 +836,13 @@ impl Game {
         if self.selection.is_none() && self.pile_len(pile) == index {
             // A tap on an empty place, with nothing in hand, is not a move and
             // not a mistake worth a sentence.
-            return Report::quiet("");
+            return None;
         }
         if let Some(selection) = self.selection {
             if selection.pile == pile {
                 if selection.index == index {
                     self.selection = None;
-                    return Report::quiet("Selection cleared.");
+                    return None;
                 }
                 return self.select(pile, index);
             }
@@ -851,32 +852,21 @@ impl Game {
             if self.can_pick(pile, index) {
                 return self.select(pile, index);
             }
-            return Report::quiet("That card cannot go there.");
+            return refuse("That card cannot go there.");
         }
         self.select(pile, index)
     }
 
     /// Pick up the run beginning at `index`, if it is movable.
-    pub fn select(&mut self, pile: Pile, index: usize) -> Report {
-        let Some(count) = self.run_len_inner(pile, index) else {
+    pub fn select(&mut self, pile: Pile, index: usize) -> Words {
+        if self.run_len_inner(pile, index).is_none() {
             if self.is_face_down(pile, index) && index < self.pile_len(pile) {
-                return Report::quiet("That card is face down.");
+                return refuse("That card is face down.");
             }
-            return Report::quiet("That card cannot move.");
-        };
-        let Some(card) = self.card_at(pile, index) else {
-            return Report::quiet("That card cannot move.");
-        };
-        self.selection = Some(Selection { pile, index });
-        if count == 1 {
-            Report::quiet(format!("Picked up the {}.", card.name()))
-        } else {
-            Report::quiet(format!(
-                "Picked up the {} and {} more.",
-                card.name(),
-                count - 1
-            ))
+            return refuse("That card cannot move.");
         }
+        self.selection = Some(Selection { pile, index });
+        None
     }
 
     /// Whether the run at `pile`/`index` can be picked up.
@@ -887,16 +877,14 @@ impl Game {
 
     /// Drop the held run on `to`. The page calls this on a drag; it is the same
     /// transaction as tapping the destination.
-    pub fn drop(&mut self, to: Pile) -> Report {
-        let Some(selection) = self.selection else {
-            return Report::quiet("");
-        };
+    pub fn drop(&mut self, to: Pile) -> Words {
+        let selection = self.selection?;
         if selection.pile == to {
             self.selection = None;
-            return Report::quiet("Put back.");
+            return None;
         }
         if !self.can_move(selection, to) {
-            return Report::quiet("That card cannot go there.");
+            return refuse("That card cannot go there.");
         }
         self.apply(selection, to)
     }
@@ -905,17 +893,17 @@ impl Game {
     ///
     /// A double tap is the shortcut every implementation has: home to a
     /// foundation when that is legal, otherwise onto the best column.
-    pub fn double_tap(&mut self, pile: Pile, index: usize) -> Report {
+    pub fn double_tap(&mut self, pile: Pile, index: usize) -> Words {
         if self.won {
-            return Report::quiet("The deal is over. Start a new one.");
+            return None;
         }
         let Some(card) = self.card_at(pile, index) else {
-            return Report::quiet("That card cannot move.");
+            return refuse("That card cannot move.");
         };
         if self.run_len_inner(pile, index) != Some(1) {
             // Only a single card can go home; a run is a thing to move by hand.
             self.selection = None;
-            return Report::quiet(format!("The {} is part of a run.", card.name()));
+            return refuse(format!("The {} is part of a run.", card.name()));
         }
         if let Some(foundation) = self.foundation_for(card) {
             return self.apply(Selection { pile, index }, Pile::Foundation(foundation));
@@ -925,13 +913,13 @@ impl Game {
         // card that jumps to a column the player did not choose is worse than a
         // card that stays where they left it.
         self.selection = None;
-        Report::quiet(format!("Nowhere to send the {} home.", card.name()))
+        refuse(format!("Nowhere to send the {} home.", card.name()))
     }
 
     /// Turn the stock, or turn the waste back over when the stock is empty.
-    pub fn draw(&mut self) -> Report {
+    pub fn draw(&mut self) -> Words {
         if self.won {
-            return Report::quiet("The deal is over. Start a new one.");
+            return None;
         }
         if self.stock.is_empty() {
             return self.recycle();
@@ -946,18 +934,12 @@ impl Game {
         }
         self.moves = self.moves.saturating_add(1);
         self.started = true;
-        let words = match count {
-            1 => "Turned one card from the stock.".to_owned(),
-            _ => format!("Turned {count} cards from the stock."),
-        };
-        Report::quiet(words)
+        None
     }
 
     /// Take back the last move, draw, recycle or automatic move.
-    pub fn undo(&mut self) -> Report {
-        let Some(snapshot) = self.history.pop() else {
-            return Report::quiet("Nothing to undo.");
-        };
+    pub fn undo(&mut self) -> Words {
+        let snapshot = self.history.pop()?;
         self.restore(snapshot);
         self.selection = None;
         // Taking a card back out of a deal that was finishing itself is the
@@ -967,7 +949,7 @@ impl Game {
         if self.can_autocomplete() {
             self.finish_held = true;
         }
-        Report::quiet("Undid the last move.")
+        None
     }
 
     /// True when every card is face up and the stock and waste are empty, so
@@ -1005,15 +987,15 @@ impl Game {
 
     /// Move one more card home, if the board is ready for it.
     ///
-    /// Returns `None` when there is nothing left to send home *just now*, and
+    /// Returns `false` when there is nothing left to send home *just now*, and
     /// the page stops until the deal changes again. That is not a verdict: every
     /// card being face up does not mean every card is reachable, and a run
     /// moved by hand can uncover the card that was in the way. So the finish
     /// asks again after the next move instead of deciding it is over, and it
     /// needs no switch of its own to do so.
-    pub fn autocomplete_step(&mut self) -> Option<Report> {
+    pub fn autocomplete_step(&mut self) -> bool {
         if !self.can_autocomplete() {
-            return None;
+            return false;
         }
         // Lowest rank first, so aces and twos that are buried in different
         // columns are not raced past by a higher card that happens to be on top.
@@ -1034,15 +1016,18 @@ impl Game {
                 }
             }
         }
-        let (_, column, foundation) = best?;
+        let Some((_, column, foundation)) = best else {
+            return false;
+        };
         let index = self.tableau[column].len() - 1;
-        Some(self.apply(
+        let _ = self.apply(
             Selection {
                 pile: Pile::Tableau(column),
                 index,
             },
             Pile::Foundation(foundation),
-        ))
+        );
+        true
     }
 
     /// Suggest a move. The suggestion is a heuristic, not a solver: it prefers
@@ -1363,12 +1348,15 @@ impl Game {
         !self.waste.is_empty() && self.redeal_limit().is_none_or(|max| self.redeals < max)
     }
 
-    fn recycle(&mut self) -> Report {
+    fn recycle(&mut self) -> Words {
         if self.waste.is_empty() {
-            return Report::quiet("The stock and the waste are both empty.");
+            // Nothing there at all, which the empty stock mark already says.
+            return None;
         }
         if !self.can_redeal() {
-            return Report::quiet("No passes left. Undo, or start a new game.");
+            // The one refusal the board cannot show: the waste is not empty and
+            // the stock will not take it, and nothing on screen says why.
+            return refuse("No passes left.");
         }
         self.push_history();
         self.selection = None;
@@ -1388,13 +1376,7 @@ impl Game {
             };
             self.score = (self.score + penalty).max(0);
         }
-        let words = match self.redeals_left() {
-            Some(0) => "Turned the waste back over. No passes left.".to_owned(),
-            Some(1) => "Turned the waste back over. 1 pass left.".to_owned(),
-            Some(left) => format!("Turned the waste back over. {left} passes left."),
-            None => "Turned the waste back over.".to_owned(),
-        };
-        Report::quiet(words)
+        None
     }
 
     fn run_len_inner(&self, pile: Pile, index: usize) -> Option<usize> {
@@ -1459,26 +1441,26 @@ impl Game {
         self.accepts(to, card)
     }
 
-    fn apply(&mut self, selection: Selection, to: Pile) -> Report {
+    fn apply(&mut self, selection: Selection, to: Pile) -> Words {
         let Some(count) = self.run_len_inner(selection.pile, selection.index) else {
             self.selection = None;
-            return Report::quiet("That card cannot move.");
+            return refuse("That card cannot move.");
         };
         if to == selection.pile {
             self.selection = None;
-            return Report::quiet("");
+            return None;
         }
         if to == Pile::Stock
             || to == Pile::Waste
             || (matches!(to, Pile::Foundation(_)) && count != 1)
         {
-            return Report::quiet("That card cannot go there.");
+            return refuse("That card cannot go there.");
         }
         let Some(card) = self.card_at(selection.pile, selection.index) else {
-            return Report::quiet("That card cannot move.");
+            return refuse("That card cannot move.");
         };
         if !self.accepts(to, card) {
-            return Report::quiet("That card cannot go there.");
+            return refuse("That card cannot go there.");
         }
 
         self.push_history();
@@ -1491,21 +1473,8 @@ impl Game {
             Scoring::Vegas => self.score + points,
         };
 
-        let mut words = if count == 1 {
-            format!("Moved the {} to {}.", card.name(), to.name())
-        } else {
-            format!(
-                "Moved the {} and {} more to {}.",
-                card.name(),
-                count - 1,
-                to.name()
-            )
-        };
-        if self.reveal(selection.pile) {
-            if self.scoring == Scoring::Standard {
-                self.score += 5;
-            }
-            words.push_str(" Turned over a new card.");
+        if self.reveal(selection.pile) && self.scoring == Scoring::Standard {
+            self.score += 5;
         }
 
         self.moves = self.moves.saturating_add(1);
@@ -1513,10 +1482,11 @@ impl Game {
         self.selection = None;
         if self.foundations.iter().map(Vec::len).sum::<usize>() == 52 {
             self.won = true;
-            words = self.result_words();
-            return Report { won: true, words };
         }
-        Report::quiet(words)
+        // A move is the board's to tell: the cards have gone where they were
+        // sent, and the result is the victory panel's, not a line of text under
+        // it.
+        None
     }
 
     fn points_for(&self, from: Pile, to: Pile, count: usize) -> i32 {
@@ -1808,17 +1778,53 @@ mod tests {
             0,
         );
         put_column(&mut game, 1, &[(Rank::King, Suit::Clubs)], 0);
-        let report = game.tap(Pile::Tableau(0), 1);
-        assert!(report.words.contains("Picked up"));
-        let move_report = game.tap(Pile::Tableau(1), 1);
+        assert!(game.tap(Pile::Tableau(0), 1).is_none());
+        assert!(game.tap(Pile::Tableau(1), 1).is_none());
         assert_eq!(game.pile_len(Pile::Tableau(1)), 2);
         assert_eq!(game.pile_len(Pile::Tableau(0)), 1);
-        assert!(move_report.words.contains("Moved"));
         // Alternating colours on the way down, and a king that is not on an
         // empty column is refused.
         assert!(!game.accepts(Pile::Tableau(2), Card::new(Rank::Queen, Suit::Clubs)));
         assert!(game.accepts(Pile::Tableau(2), Card::new(Rank::King, Suit::Hearts)));
         assert!(!game.accepts(Pile::Tableau(2), Card::new(Rank::Ace, Suit::Hearts)));
+    }
+
+    /// A move is the board's to tell, and the page is not a log.
+    ///
+    /// The line under the table is for the two things the cards cannot say: a
+    /// tap that was refused — nothing moved, so silence would read as a broken
+    /// control — and a question the player asked. Everything the game does of
+    /// its own accord is quiet, and the winning move is the quietest of all:
+    /// the victory panel carries the result, and a sentence under it would be
+    /// the same news twice.
+    #[test]
+    fn a_move_says_nothing_and_only_a_refusal_speaks() {
+        let mut game = empty_game(Scoring::Standard);
+        put_column(
+            &mut game,
+            0,
+            &[(Rank::King, Suit::Spades), (Rank::Queen, Suit::Hearts)],
+            0,
+        );
+        assert_eq!(game.tap(Pile::Tableau(0), 0), None, "picking a run up");
+        assert_eq!(game.tap(Pile::Tableau(1), 0), None, "putting it down");
+        assert_eq!(game.pile_len(Pile::Tableau(1)), 2);
+
+        // A tap the board cannot answer for: the queen is in hand, and column
+        // one is empty, so it will not take her.
+        assert_eq!(game.tap(Pile::Tableau(1), 1), None);
+        assert_eq!(
+            game.tap(Pile::Tableau(0), 0).as_deref(),
+            Some("That card cannot go there.")
+        );
+
+        let mut ready = a_ready_board();
+        for column in 0..4 {
+            assert_eq!(ready.tap(Pile::Tableau(column), 0), None);
+            assert_eq!(ready.tap(Pile::Foundation(column), 0), None);
+        }
+        assert!(ready.won());
+        assert!(ready.result_words().starts_with("You won"));
     }
 
     #[test]
@@ -1846,10 +1852,9 @@ mod tests {
         let mut game = empty_game(Scoring::Standard);
         game.stock = (0..7).collect();
         let original = game.stock.clone();
-        let report = game.draw();
+        assert!(game.draw().is_none());
         assert_eq!(game.waste.len(), 3);
         assert_eq!(game.stock.len(), 4);
-        assert!(report.words.contains("3 cards"));
         game.draw();
         game.draw();
         assert!(game.stock.is_empty());
@@ -1879,8 +1884,7 @@ mod tests {
         assert_eq!(game.redeals_left(), Some(0));
         game.draw();
         assert!(game.stock.is_empty());
-        let refused = game.draw();
-        assert!(refused.words.contains("No passes left"));
+        assert_eq!(game.draw().as_deref(), Some("No passes left."));
         assert!(game.stock.is_empty());
     }
 
@@ -1890,8 +1894,7 @@ mod tests {
         game.difficulty = Difficulty::Easy;
         game.stock = vec![0];
         game.draw();
-        let refused = game.draw();
-        assert!(refused.words.contains("No passes left"));
+        assert_eq!(game.draw().as_deref(), Some("No passes left."));
         assert_eq!(game.score, -52);
     }
 
@@ -1907,8 +1910,7 @@ mod tests {
         put_column(&mut game, 1, &[(Rank::King, Suit::Clubs)], 0);
         // Move the ace away, exposing the hidden two.
         game.tap(Pile::Tableau(0), 1);
-        let report = game.tap(Pile::Foundation(0), 0);
-        assert!(report.words.contains("Turned over"));
+        assert!(game.tap(Pile::Foundation(0), 0).is_none());
         assert_eq!(game.score, 15, "10 home and 5 for the turn");
         assert!(game.tableau[0].is_face_up(0));
         game.undo();
@@ -1957,8 +1959,7 @@ mod tests {
     #[test]
     fn nothing_to_undo_says_so_rather_than_panicking() {
         let mut game = Game::new(Difficulty::Medium, Scoring::Standard, 9);
-        let report = game.undo();
-        assert!(report.words.contains("Nothing to undo"));
+        assert!(game.undo().is_none());
     }
 
     #[test]
@@ -1984,11 +1985,11 @@ mod tests {
         }
         assert!(game.can_autocomplete());
         for _ in 0..4 {
-            assert!(game.autocomplete_step().is_some());
+            assert!(game.autocomplete_step());
         }
         assert!(game.won());
         assert!(game.result_words().contains("You won"));
-        assert!(game.autocomplete_step().is_none());
+        assert!(!game.autocomplete_step());
     }
 
     /// A board with every card but the four kings home, and the kings on their
@@ -2048,7 +2049,7 @@ mod tests {
         );
         assert!(game.can_autocomplete());
         assert!(game.finishing());
-        assert!(game.autocomplete_step().is_none());
+        assert!(!game.autocomplete_step());
         assert!(!game.won());
         assert_eq!(game.moves(), 0, "a step that moves nothing is not a move");
         assert!(!game.finish_held(), "the deal is the player's, not held");
@@ -2227,8 +2228,11 @@ mod tests {
             .cards
             .push(id(&game, Rank::Two, Suit::Hearts));
         game.tableau[0].up = 0;
-        let report = game.double_tap(Pile::Tableau(0), 0);
-        assert!(report.words.contains("Nowhere to send"), "{}", report.words);
+        assert_eq!(
+            game.double_tap(Pile::Tableau(0), 0).as_deref(),
+            Some("Nowhere to send the two of hearts home."),
+            "a double tap that sends nothing nowhere says why it did nothing"
+        );
         assert_eq!(game.pile_len(Pile::Tableau(0)), 1, "the card stayed put");
         assert_eq!(game.pile_len(Pile::Tableau(1)), 0, "and did not jump");
         assert_eq!(game.selection(), None, "and nothing is left held");
@@ -2238,8 +2242,10 @@ mod tests {
             .cards
             .push(id(&game, Rank::Ace, Suit::Clubs));
         game.tableau[2].up = 0;
-        let report = game.double_tap(Pile::Tableau(2), 0);
-        assert!(report.words.contains("Moved"), "{}", report.words);
+        assert!(
+            game.double_tap(Pile::Tableau(2), 0).is_none(),
+            "a card that goes home is the board's to report"
+        );
         assert_eq!(game.pile_len(Pile::Tableau(2)), 0);
         assert_eq!(game.pile_len(Pile::Foundation(0)), 1);
     }
@@ -2256,8 +2262,10 @@ mod tests {
             .cards
             .push(id(&game, Rank::Ace, Suit::Spades));
         game.tableau[0].up = 0;
-        let report = game.double_tap(Pile::Tableau(0), 0);
-        assert!(report.words.contains("part of a run"), "{}", report.words);
+        assert_eq!(
+            game.double_tap(Pile::Tableau(0), 0).as_deref(),
+            Some("The two of hearts is part of a run.")
+        );
         assert_eq!(game.pile_len(Pile::Tableau(0)), 2);
     }
 

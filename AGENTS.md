@@ -10,7 +10,8 @@ applies here. What follows is what is specific to this game.
   code, and the printed short form. No `web-sys`, so `cargo test` runs it.
 - `src/game.rs` — Klondike: the deal, the move grammar, the score, the undo
   history, the hint heuristic, the save format, and **every word the page
-  shows**. Also `web-sys`-free.
+  shows** — which, since the page stopped narrating moves, is a refusal or an
+  answer to a question and almost nothing else. Also `web-sys`-free.
 - `src/scene.rs` — the game as the board draws it: the piles, how each fans,
   how many cells each occupies, where the keyboard starts. Compiled for the
   host too, so `cargo test` checks the board's *arrangement* rather than only
@@ -175,9 +176,48 @@ A board with every card up and nothing that can go home is *not* stopped, and
 deliberately so. Every card being face up does not mean every card is reachable:
 a run moved by hand can uncover the one that was in the way, so the finish asking
 again after the next move is right and a flag saying "over" would be wrong. The
-step returns nothing, the page stops its timer, and the player's own move is what
-is on the status line — the finish takes over again the moment a card is
-reachable.
+step reports that it moved nothing, the page stops its timer, and the finish
+takes over again the moment a card is reachable.
+
+**A move says nothing: the page is not a log.** Every mutation used to narrate
+itself on the line under the table — "Moved the 5♠ to column 3.", "Turned 3
+cards from the stock.", "Picked up the 9♥.", "Put back.", "Undid the last move."
+— and the line was the third copy of news the player already had: they sent the
+card, they watched it land, and the header had counted the move. It also cost a
+row of a board that is laid out from the height it is given, and a line that is
+usually stale ("Picked up the 9♥" after the 9♥ is long since played) is worse
+than an empty one.
+
+So a mutation returns `Words` (`Option<String>`) and says `None` unless the
+board cannot speak for itself. Two things can, and both stay:
+
+- **A refusal.** A tap that does nothing is indistinguishable from a control
+  that is broken, so "That card cannot go there.", "That card is face down.",
+  "Nowhere to send the eight of spades home." and "No passes left." are what the
+  line is for. They are rare by construction — they are only ever an error.
+- **An answer to a question.** Hint and Stuck? are buttons the player pressed
+  for a sentence, and the ring that marks both ends of a hinted move is a
+  picture: `aria-hidden`, and no use to a screen reader.
+
+The win is in neither group. The victory panel carries the result, a sentence
+underneath it is the same news twice, and the panel covers it anyway.
+
+A silent action still *writes* to the live region — with the empty string. It is
+how the sentence from an old tap stops standing under a board it is not about,
+and it is why `#status:empty` is `display: none`: the line takes no room and no
+gap until there is something to say, which measured out as 17px of table given
+back. The trade is that a message borrows a line back for as long as it is up:
+the table resizes by that line, and by no more.
+
+The shared `shell.rs` needed no change for any of this, which is the point of
+`Words` living in the game: `take_words` returning `None` says nothing, and
+`Some("")` clears. A game that narrates nothing is not a game the shell has to
+know about.
+
+A screen reader loses the announcement a move used to make, and gets the board
+instead: every pile is named with its count and its top card
+(`Game::pile_label`), and the card that moved keeps the focus. A refusal is
+still spoken, which is the one place where silence would be a dead control.
 
 **"Stuck?" answers a question the hint cannot, and says which answer it has.**
 `src/solver.rs` searches the positions reachable from the current board for a
