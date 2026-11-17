@@ -217,9 +217,9 @@ So a mutation returns `Words` (`Option<String>`) and says `None` unless the
 board cannot speak for itself. Two things can, and both stay:
 
 - **A refusal.** A tap that does nothing is indistinguishable from a control
-  that is broken, so "Can't go there.", "Face down.", "Part of a run.", "Nowhere
-  to go." and "No passes left." are what the line is for. They are rare by
-  construction — they are only ever an error.
+  that is broken, so "Can't go there", "Face down", "Part of a run", "Nowhere
+  to go" and "No passes left" are what the line is for. They are rare by
+  construction — they are only ever an error, and none of them is a sentence.
 - **An answer to a question.** Hint and Stuck? are buttons the player pressed
   for an answer, and what they get is a picture — the ring on both ends of a
   hinted move, which is `aria-hidden` and no use to a screen reader — plus the
@@ -327,11 +327,11 @@ number of passes would either miss a reachable card or promise an unreachable
 one.
 
 The same walk answers for the recycle (`Hint::Recycle`), which is why a waste
-that can only be turned over into itself says `Stuck.` too.
+that can only be turned over into itself says `Stuck` too.
 
 Before this, a saved board with ten unplayable cards in the stock and nothing
 else to do said "Turn over the next three cards." for ever and `Not stuck.`
-above it — the report that started this. It now says `Stuck.` from both
+above it — the report that started this. It now says `Stuck` from both
 buttons.
 
 **The walk spends the passes the player has, not the deal's allowance.** The
